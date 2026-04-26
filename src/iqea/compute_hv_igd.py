@@ -1,0 +1,365 @@
+
+import csv
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+
+EPS = 1e-12
+
+# =========================
+# 固定输入/输出路径
+# =========================
+IQEA_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\iqea_data\iqea_20runs_all_fronts.csv"
+MOPSO_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\mopso_data\combined_front_all_runs.csv"
+NSGAII_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\nsga2_data\nsga2_20runs_all_fronts.csv"
+
+OUT_DIR = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\reference_front_results"
+
+# HV 在归一化空间中的参考点
+HV_REF_POINT = np.array([1.1, 1.1, 1.1], dtype=float)
+
+
+@dataclass
+class PointRecord:
+    algorithm: str
+    run: int
+    values: np.ndarray  # [CT, LoadSTD, QLoss]
+
+
+def read_front_csv(path: str, algorithm: str) -> List[PointRecord]:
+    """
+    读取前沿文件，要求至少有三列:
+        CT, LoadSTD, QLoss
+    可选列:
+        run
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"文件不存在: {path}")
+
+    records: List[PointRecord] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"CT", "LoadSTD", "QLoss"}
+        actual = set(reader.fieldnames or [])
+        if not required.issubset(actual):
+            raise ValueError(
+                f"{path} 缺少必要列 {required}，当前列为: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            try:
+                run = int(row["run"]) if "run" in row and str(row["run"]).strip() != "" else -1
+                ct = float(row["CT"])
+                std = float(row["LoadSTD"])
+                ql = float(row["QLoss"])
+            except Exception as e:
+                raise ValueError(f"解析 {path} 中的行失败: {row}") from e
+
+            records.append(
+                PointRecord(
+                    algorithm=algorithm,
+                    run=run,
+                    values=np.array([ct, std, ql], dtype=float),
+                )
+            )
+    return records
+
+
+def save_csv(path: str, header: List[str], rows: List[List[object]]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def dedupe_points(points: np.ndarray, tol: float = 1e-12) -> np.ndarray:
+    """按近似数值去重。"""
+    if len(points) == 0:
+        return points
+    seen = set()
+    kept = []
+    scale = max(0, int(abs(round(math.log10(tol))))) if tol > 0 else 12
+    for p in points:
+        key = tuple(np.round(p, scale).tolist())
+        if key not in seen:
+            seen.add(key)
+            kept.append(p)
+    return np.array(kept, dtype=float)
+
+
+def non_dominated_mask(points: np.ndarray, eps: float = EPS) -> np.ndarray:
+    """
+    最小化问题的非支配筛选。
+    若存在 j 使得：
+        points[j] <= points[i]（各目标都不差）
+        且至少一个目标严格更优
+    则 i 被支配。
+    """
+    n = len(points)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+
+    mask = np.ones(n, dtype=bool)
+    for i in range(n):
+        if not mask[i]:
+            continue
+        for j in range(n):
+            if i == j:
+                continue
+            if np.all(points[j] <= points[i] + eps) and np.any(points[j] < points[i] - eps):
+                mask[i] = False
+                break
+    return mask
+
+
+def filter_nondominated(points: np.ndarray) -> np.ndarray:
+    """去重后做非支配筛选。"""
+    points = dedupe_points(points)
+    if len(points) == 0:
+        return points
+    mask = non_dominated_mask(points)
+    points = points[mask]
+    return points[np.lexsort((points[:, 2], points[:, 1], points[:, 0]))]
+
+
+def normalize_points(points: np.ndarray, mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
+    spans = np.maximum(maxs - mins, EPS)
+    return (points - mins) / spans
+
+
+def hypervolume_1d(points_1d: np.ndarray, ref_1d: float) -> float:
+    m = float(np.min(points_1d))
+    return max(0.0, ref_1d - m)
+
+
+def hypervolume_recursive(points: np.ndarray, ref: np.ndarray) -> float:
+    """
+    最小化问题的精确 HV 递归计算。
+    假设:
+      - 输入点已非支配
+      - 输入点都不超过 ref
+    """
+    if len(points) == 0:
+        return 0.0
+
+    dim = points.shape[1]
+    if dim == 1:
+        return hypervolume_1d(points[:, 0], float(ref[0]))
+
+    xs = sorted(set(float(x) for x in points[:, 0]), reverse=True)
+    hv = 0.0
+    prev = float(ref[0])
+
+    for x in xs:
+        if prev <= x + EPS:
+            continue
+        subset = points[points[:, 0] <= x + EPS][:, 1:]
+        slab = (prev - x) * hypervolume_recursive(subset, ref[1:])
+        hv += slab
+        prev = x
+    return hv
+
+
+def compute_hv(norm_front: np.ndarray, ref_point: np.ndarray) -> float:
+    """
+    归一化最小化空间中的 HV。
+    超过参考点的点不会贡献体积，因此先过滤。
+    """
+    if len(norm_front) == 0:
+        return float("nan")
+
+    valid = np.all(norm_front <= ref_point + EPS, axis=1)
+    points = norm_front[valid]
+    if len(points) == 0:
+        return 0.0
+
+    points = filter_nondominated(points)
+    return float(hypervolume_recursive(points, ref_point))
+
+
+def compute_igd(norm_front: np.ndarray, norm_reference_front: np.ndarray) -> float:
+    """
+    归一化空间中的 IGD。
+    """
+    if len(norm_reference_front) == 0 or len(norm_front) == 0:
+        return float("nan")
+
+    dists = []
+    for r in norm_reference_front:
+        diff = norm_front - r
+        dist = np.sqrt(np.sum(diff * diff, axis=1))
+        dists.append(np.min(dist))
+    return float(np.mean(dists))
+
+
+def mean_std(values: List[float]) -> Tuple[float, float]:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    if arr.size == 1:
+        return float(arr.mean()), 0.0
+    return float(arr.mean()), float(arr.std(ddof=1))
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("=" * 80)
+    print("开始读取三个算法的 Pareto 解文件...")
+    print(f"IQEA   : {IQEA_PATH}")
+    print(f"MOPSO  : {MOPSO_PATH}")
+    print(f"NSGA-II: {NSGAII_PATH}")
+    print("=" * 80)
+
+    all_records: List[PointRecord] = []
+    all_records.extend(read_front_csv(IQEA_PATH, "IQEA"))
+    all_records.extend(read_front_csv(MOPSO_PATH, "MOPSO"))
+    all_records.extend(read_front_csv(NSGAII_PATH, "NSGA-II"))
+
+    if len(all_records) == 0:
+        raise ValueError("未读取到任何前沿点，请检查输入文件。")
+
+    # 1) 合并为并集 U
+    union_points = np.array([r.values for r in all_records], dtype=float)
+    union_points = dedupe_points(union_points)
+
+    # 2) 对 U 做一次非支配筛选，得到经验 reference front R
+    reference_front = filter_nondominated(union_points)
+
+    # 保存 U 和 R
+    union_csv = os.path.join(OUT_DIR, "union_set_U.csv")
+    save_csv(
+        union_csv,
+        ["CT", "LoadSTD", "QLoss"],
+        [[f"{p[0]:.10f}", f"{p[1]:.10f}", f"{p[2]:.10f}"] for p in union_points],
+    )
+
+    reference_csv = os.path.join(OUT_DIR, "reference_front.csv")
+    save_csv(
+        reference_csv,
+        ["CT", "LoadSTD", "QLoss"],
+        [[f"{p[0]:.10f}", f"{p[1]:.10f}", f"{p[2]:.10f}"] for p in reference_front],
+    )
+
+    # 保存带来源信息的 R
+    ref_with_source_rows = []
+    for rec in all_records:
+        p = rec.values
+        if np.any(np.all(np.isclose(reference_front, p, atol=1e-12, rtol=0.0), axis=1)):
+            ref_with_source_rows.append(
+                [rec.algorithm, rec.run, f"{p[0]:.10f}", f"{p[1]:.10f}", f"{p[2]:.10f}"]
+            )
+
+    reference_with_source_csv = os.path.join(OUT_DIR, "reference_front_with_source.csv")
+    save_csv(
+        reference_with_source_csv,
+        ["algorithm", "run", "CT", "LoadSTD", "QLoss"],
+        ref_with_source_rows,
+    )
+
+    # 3) 使用 U 上的全局 min-max 对所有目标归一化
+    mins = np.min(union_points, axis=0)
+    maxs = np.max(union_points, axis=0)
+
+    norm_reference_front = normalize_points(reference_front, mins, maxs)
+
+    normalization_json = os.path.join(OUT_DIR, "normalization_info.json")
+    with open(normalization_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "normalization_based_on": "union set U",
+                "U_size": int(len(union_points)),
+                "R_size": int(len(reference_front)),
+                "mins": mins.tolist(),
+                "maxs": maxs.tolist(),
+                "hv_reference_point": HV_REF_POINT.tolist(),
+                "note": "All objectives are minimized. HV and IGD are computed in the same normalized space.",
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    # 4) 按算法 / 按运行次序分组
+    algo_run_to_points: Dict[Tuple[str, int], List[np.ndarray]] = {}
+    for rec in all_records:
+        algo_run_to_points.setdefault((rec.algorithm, rec.run), []).append(rec.values)
+
+    per_run_rows = []
+    algo_hv_values: Dict[str, List[float]] = {"IQEA": [], "MOPSO": [], "NSGA-II": []}
+    algo_igd_values: Dict[str, List[float]] = {"IQEA": [], "MOPSO": [], "NSGA-II": []}
+
+    # 5) 每次运行分别计算 HV 和 IGD
+    for (algo, run), pts_list in sorted(algo_run_to_points.items(), key=lambda x: (x[0][0], x[0][1])):
+        run_front = filter_nondominated(np.array(pts_list, dtype=float))
+        norm_run_front = normalize_points(run_front, mins, maxs)
+
+        hv = compute_hv(norm_run_front, HV_REF_POINT)
+        igd = compute_igd(norm_run_front, norm_reference_front)
+
+        algo_hv_values[algo].append(hv)
+        algo_igd_values[algo].append(igd)
+
+        per_run_rows.append([
+            algo,
+            run,
+            len(run_front),
+            f"{hv:.10f}",
+            f"{igd:.10f}",
+        ])
+
+    per_run_csv = os.path.join(OUT_DIR, "per_run_hv_igd.csv")
+    save_csv(
+        per_run_csv,
+        ["algorithm", "run", "front_size", "HV", "IGD"],
+        per_run_rows,
+    )
+
+    # 6) 汇总 mean ± std
+    mean_std_rows = []
+    for algo in ["IQEA", "MOPSO", "NSGA-II"]:
+        hv_mean, hv_std = mean_std(algo_hv_values[algo])
+        igd_mean, igd_std = mean_std(algo_igd_values[algo])
+
+        mean_std_rows.append([
+            algo,
+            len(algo_hv_values[algo]),
+            f"{hv_mean:.10f}",
+            f"{hv_std:.10f}",
+            f"{igd_mean:.10f}",
+            f"{igd_std:.10f}",
+            f"{hv_mean:.10f} ± {hv_std:.10f}",
+            f"{igd_mean:.10f} ± {igd_std:.10f}",
+        ])
+
+    mean_std_csv = os.path.join(OUT_DIR, "hv_igd_mean_std.csv")
+    save_csv(
+        mean_std_csv,
+        ["algorithm", "n_runs", "HV_mean", "HV_std", "IGD_mean", "IGD_std", "HV_mean_std", "IGD_mean_std"],
+        mean_std_rows,
+    )
+
+    print("=" * 80)
+    print("规范流程计算完成。")
+    print(f"并集 U 文件: {union_csv}")
+    print(f"reference front 文件: {reference_csv}")
+    print(f"带来源 reference front 文件: {reference_with_source_csv}")
+    print(f"每次运行 HV/IGD 文件: {per_run_csv}")
+    print(f"HV/IGD mean±std 文件: {mean_std_csv}")
+    print(f"归一化信息文件: {normalization_json}")
+    print("-" * 80)
+    print(f"|U| = {len(union_points)}, |R| = {len(reference_front)}")
+    print("HV 和 IGD 的 mean ± std：")
+    for row in mean_std_rows:
+        print(f"{row[0]:7s} | HV = {row[6]} | IGD = {row[7]}")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
