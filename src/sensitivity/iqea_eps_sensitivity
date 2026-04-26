@@ -1,0 +1,1113 @@
+import argparse
+import json
+import platform
+import sys
+import os
+import csv
+import time
+import math
+import random
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+
+# =========================================================
+# 0. Problem data
+# =========================================================
+NUM_TASKS = 24
+NUM_STATIONS = 6
+TASK_TIMES = [
+    55, 65, 55, 45, 45, 35, 55, 160, 35, 70,
+    100, 80, 35, 60, 60, 160, 35, 70, 450, 40,
+    35, 420, 40, 35
+]
+
+ALLOWED_TOOLS: List[set] = []
+for task_idx in range(NUM_TASKS):
+    task_id = task_idx + 1
+    if task_id in {1, 4, 5, 8, 9, 13, 17, 24}:
+        ALLOWED_TOOLS.append({0})
+    elif task_id in {2, 3, 6, 10}:
+        ALLOWED_TOOLS.append({0, 1})
+    else:
+        ALLOWED_TOOLS.append({2})
+
+random.seed(2026)
+TOOL_TYPES = [random.choice(list(tools)) for tools in ALLOWED_TOOLS]
+NUM_TOOL_TYPES = len(set(TOOL_TYPES))
+
+TOOL_SWITCH_COST_MATRIX = np.array([
+    [0.0, 1.5, 1.8],
+    [1.5, 0.0, 1.2],
+    [1.8, 1.2, 0.0],
+], dtype=float)
+
+PRECEDENCE_CONSTRAINTS = [
+    (0, 3), (1, 3), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8),
+    (9, 11), (10, 11), (11, 12), (13, 15), (14, 15), (15, 16),
+    (17, 18), (18, 19), (8, 20), (12, 20), (16, 20), (19, 20),
+    (20, 21), (21, 22), (22, 23)
+]
+
+EPS = 1e-12
+MAX_ARCHIVE_SIZE = 20
+
+QUAL_ALPHA = 0.2
+QUAL_BETA = 0.5
+QUAL_GAMMA = 0.3
+TARGET_EXPANSION = 0.05
+POSITIVE_WEIGHT = 1.5
+NEGATIVE_WEIGHT = 0.8
+
+# =========================================================
+# 1. Epsilon setting
+# =========================================================
+EPS_CT = 1.0
+EPS_STD = 0.5
+
+
+def set_epsilon(eps_ct: float, eps_std: float) -> None:
+    global EPS_CT, EPS_STD
+    EPS_CT = float(eps_ct)
+    EPS_STD = float(eps_std)
+
+
+# 2. Quality model and objective evaluation
+def simple_quality_model(task: int, station: int, tool: int):
+    tool_base = {
+        0: (0.8, 0.06, 0.02),
+        1: (0.6, 0.08, -0.01),
+        2: (0.5, 0.10, 0.03),
+    }
+    rb, db, eb = tool_base.get(tool, (0.7, 0.08, 0.0))
+    task_scale = 1.0 + (TASK_TIMES[task] / (max(TASK_TIMES) + EPS)) * 0.2
+    station_adjust = 1.0 + ((station % 3) - 1) * 0.2
+    roughness = rb * task_scale * station_adjust
+    defect_rate = min(max(db * task_scale * station_adjust, 0.0), 0.5)
+    expansion = eb * task_scale * station_adjust
+    return roughness, defect_rate, expansion
+
+
+def calculate_quality_loss(solution) -> float:
+    station_assignment, station_sequences, tool_assignment = solution
+    total_roughness = total_defect_rate = total_expansion = 0.0
+    for task in range(NUM_TASKS):
+        station = int(station_assignment[task])
+        tool = int(tool_assignment[task])
+        r, d, e = simple_quality_model(task, station, tool)
+        total_roughness += r
+        total_defect_rate += d
+        total_expansion += e
+    avg_roughness = total_roughness / NUM_TASKS if NUM_TASKS > 0 else 0.0
+    avg_defect_rate = total_defect_rate / NUM_TASKS if NUM_TASKS > 0 else 0.0
+    avg_expansion = total_expansion / NUM_TASKS if NUM_TASKS > 0 else 0.0
+    roughness_loss = avg_roughness
+    defect_loss = avg_defect_rate
+    expansion_diff = avg_expansion - TARGET_EXPANSION
+    expansion_loss = (expansion_diff * POSITIVE_WEIGHT if expansion_diff > 0 else abs(expansion_diff) * NEGATIVE_WEIGHT)
+    return QUAL_ALPHA * roughness_loss + QUAL_BETA * defect_loss + QUAL_GAMMA * expansion_loss
+
+
+def evaluate_welding_objectives_with_penalty(solution):
+    station_assignment, station_sequences, tool_assignment = solution
+    penalty = 0.0
+    for pre, post in PRECEDENCE_CONSTRAINTS:
+        if station_assignment[pre] > station_assignment[post]:
+            penalty += 15.0
+        elif station_assignment[pre] == station_assignment[post]:
+            seq = station_sequences[station_assignment[pre]]
+            try:
+                if seq.index(pre) > seq.index(post):
+                    penalty += 10.0
+            except ValueError:
+                penalty += 5.0
+    station_times = np.zeros(NUM_STATIONS)
+    for s in range(NUM_STATIONS):
+        seq = station_sequences[s]
+        if not seq:
+            continue
+        station_times[s] += TASK_TIMES[seq[0]]
+        current_tool = tool_assignment[seq[0]]
+        for idx in range(1, len(seq)):
+            task = seq[idx]
+            prev_tool = current_tool
+            current_tool = tool_assignment[task]
+            station_times[s] += TASK_TIMES[task]
+            if prev_tool != current_tool:
+                station_times[s] += TOOL_SWITCH_COST_MATRIX[prev_tool, current_tool]
+    ct = float(np.max(station_times))
+    valid_station_times = station_times[station_times > 0]
+    load_std = float(np.std(valid_station_times)) if len(valid_station_times) > 1 else 0.0
+    qloss = float(calculate_quality_loss(solution))
+    penalized_ct = ct + penalty
+    penalized_load_std = load_std + penalty
+    penalized_qloss = qloss + penalty
+    return (ct, load_std, qloss), (penalized_ct, penalized_load_std, penalized_qloss), penalty
+
+
+# 3. Dominance functions
+def eps_dominates(a, b) -> bool:
+    ct_dominated = a[0] <= b[0] + EPS_CT
+    std_dominated = a[1] <= b[1] + EPS_STD
+    qloss_dominated = a[2] < b[2]
+    all_dominated = ct_dominated and std_dominated and qloss_dominated
+    ct_strict = a[0] < b[0] - EPS_CT
+    std_strict = a[1] < b[1] - EPS_STD
+    qloss_strict = a[2] < b[2]
+    any_strict = ct_strict or std_strict or qloss_strict
+    return all_dominated and any_strict
+
+
+def strict_dominates(a, b) -> bool:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    return bool(np.all(a <= b + EPS) and np.any(a < b - EPS))
+
+
+# 4. Archive
+def calculate_crowding_distance(pareto_front):
+    n = len(pareto_front)
+    if n == 0:
+        return []
+    objectives = np.array([obj for _, obj in pareto_front])
+    crowding_distances = np.zeros(n)
+    for m in range(3):
+        sorted_indices = np.argsort(objectives[:, m])
+        crowding_distances[sorted_indices[0]] = np.inf
+        crowding_distances[sorted_indices[-1]] = np.inf
+        if n > 2:
+            min_val = objectives[sorted_indices[0], m]
+            max_val = objectives[sorted_indices[-1], m]
+            range_val = max_val - min_val
+            if range_val > EPS:
+                for i in range(1, n - 1):
+                    prev_obj = objectives[sorted_indices[i - 1], m]
+                    next_obj = objectives[sorted_indices[i + 1], m]
+                    crowding_distances[sorted_indices[i]] += (next_obj - prev_obj) / range_val
+    return crowding_distances.tolist()
+
+
+def update_archive(archive, cand_solution, cand_obj):
+    for _, obj in archive:
+        if eps_dominates(obj, cand_obj):
+            return archive
+    new_archive = [(sol, obj) for sol, obj in archive if not eps_dominates(cand_obj, obj)]
+    new_archive.append((cand_solution, cand_obj))
+    if len(new_archive) > MAX_ARCHIVE_SIZE:
+        crowding_distances = calculate_crowding_distance(new_archive)
+        sorted_indices = np.argsort(crowding_distances)[::-1]
+        new_archive = [new_archive[i] for i in sorted_indices[:MAX_ARCHIVE_SIZE]]
+    return new_archive
+
+
+def select_representative_solutions(pareto_archive, w=(0.6, 0.2, 0.2)):
+    reps = []
+    if not pareto_archive:
+        return reps
+    w = np.asarray(w, dtype=float)
+    w = w / (w.sum() + EPS)
+    objs = np.array([obj for _, obj in pareto_archive], dtype=float)
+    mins = objs.min(axis=0)
+    maxs = objs.max(axis=0)
+    ranges = np.maximum(maxs - mins, EPS)
+    norm_objs = (objs - mins) / ranges
+    d = np.sqrt(np.sum(w * (norm_objs * norm_objs), axis=1))
+    idx_ideal = int(np.argmin(d))
+    reps.append(("Ideal-point", pareto_archive[idx_ideal]))
+    return reps
+
+
+def majority_beats(obj_a, obj_b, k=2):
+    obj_a = np.asarray(obj_a, dtype=float)
+    obj_b = np.asarray(obj_b, dtype=float)
+    better_cnt = int(np.sum(obj_a < obj_b))
+    return better_cnt >= k
+
+
+def select_final_solution_majority(pareto_archive):
+    if not pareto_archive:
+        return None, None, {"wins": [], "losses": [], "scores": []}
+    objs = [obj for _, obj in pareto_archive]
+    n = len(objs)
+    wins = np.zeros(n, dtype=int)
+    losses = np.zeros(n, dtype=int)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if majority_beats(objs[i], objs[j], k=2):
+                wins[i] += 1
+            if majority_beats(objs[j], objs[i], k=2):
+                losses[i] += 1
+    scores = wins - losses
+    best_score = np.max(scores)
+    cand_idx = np.where(scores == best_score)[0].tolist()
+    def tie_key(i):
+        ct, std, ql = objs[i]
+        return (ct, std, ql)
+    best_i = min(cand_idx, key=tie_key)
+    best_sol, best_obj = pareto_archive[best_i]
+    stats = {
+        "wins": wins.tolist(),
+        "losses": losses.tolist(),
+        "scores": scores.tolist(),
+        "best_index": best_i,
+        "best_score": int(best_score),
+        "num_solutions": n,
+    }
+    return best_sol, best_obj, stats
+
+
+# 5. Observation and quantum update
+def observe_individual(Q_j, n_obs):
+    candidates = []
+    for _ in range(n_obs):
+        observed_bits = []
+        ptr = 0
+        station_assignment = np.zeros(NUM_TASKS, dtype=int)
+        tool_assignment = np.zeros(NUM_TASKS, dtype=int)
+        rand_keys = np.zeros(NUM_TASKS)
+        for task in range(NUM_TASKS):
+            st_probs = []
+            for s in range(NUM_STATIONS):
+                alpha, beta = Q_j[ptr]
+                p0 = float(np.abs(alpha) ** 2)
+                st_probs.append(p0)
+                observed_bits.append(0 if np.random.rand() < p0 else 1)
+                ptr += 1
+            st_probs = np.array(st_probs)
+            st_probs = st_probs / st_probs.sum() if st_probs.sum() > EPS else (np.ones(NUM_STATIONS) / NUM_STATIONS)
+            station_assignment[task] = np.random.choice(NUM_STATIONS, p=st_probs)
+        for task in range(NUM_TASKS):
+            tl_probs = []
+            for tt in range(NUM_TOOL_TYPES):
+                alpha, beta = Q_j[ptr]
+                p0 = float(np.abs(alpha) ** 2)
+                tl_probs.append(p0)
+                observed_bits.append(0 if np.random.rand() < p0 else 1)
+                ptr += 1
+            tl_probs = np.array(tl_probs)
+            if tl_probs.sum() < EPS:
+                chosen_tool = np.random.choice(list(ALLOWED_TOOLS[task]))
+            else:
+                tl_probs /= tl_probs.sum()
+                chosen_tool = np.random.choice(NUM_TOOL_TYPES, p=tl_probs)
+                if chosen_tool not in ALLOWED_TOOLS[task]:
+                    allowed = sorted(ALLOWED_TOOLS[task])
+                    chosen_tool = min(allowed, key=lambda x: abs(x - chosen_tool))
+            tool_assignment[task] = chosen_tool
+        for task in range(NUM_TASKS):
+            alpha, beta = Q_j[ptr]
+            observed_bits.append(0 if np.random.rand() < abs(alpha) ** 2 else 1)
+            rand_keys[task] = np.random.rand()
+            ptr += 1
+        station_sequences = [[] for _ in range(NUM_STATIONS)]
+        for task, s in enumerate(station_assignment):
+            station_sequences[s].append((task, rand_keys[task]))
+        for s in range(NUM_STATIONS):
+            station_sequences[s].sort(key=lambda x: x[1])
+            station_sequences[s] = [t for t, _ in station_sequences[s]]
+        sol = (station_assignment, station_sequences, tool_assignment)
+        original_obj, penalized_obj, _ = evaluate_welding_objectives_with_penalty(sol)
+        candidates.append((sol, np.array(observed_bits, dtype=int), original_obj, penalized_obj))
+    dominated_counts = []
+    for i, (_, _, _, penalized_obj_i) in enumerate(candidates):
+        cnt = 0
+        for j, (_, _, _, penalized_obj_j) in enumerate(candidates):
+            if i != j and eps_dominates(penalized_obj_j, penalized_obj_i):
+                cnt += 1
+        dominated_counts.append(cnt)
+    best_index = int(np.argmin(dominated_counts))
+    return candidates[best_index][0], candidates[best_index][1], candidates[best_index][2]
+
+
+def update_Q(Q, guided_archive, X_obs, t, max_iter):
+    pop_size, num_qubits, _ = Q.shape
+    new_Q = np.copy(Q)
+    valid_size = len(guided_archive)
+    if valid_size == 0:
+        return new_Q
+    progress = t / max_iter
+    reps = select_representative_solutions(guided_archive)
+    if reps:
+        p_random = 0.45 * (1 - progress) + 0.15
+        p_ideal = 1.0 - p_random
+        choice = np.random.choice(["ideal", "random"], p=[p_ideal, p_random])
+        ref_solution = reps[0][1][0] if choice == "ideal" else random.choice(guided_archive)[0]
+    else:
+        ref_station = np.array([i % NUM_STATIONS for i in range(NUM_TASKS)])
+        ref_tool = np.array([min(ALLOWED_TOOLS[i]) for i in range(NUM_TASKS)])
+        ref_seq = [[] for _ in range(NUM_STATIONS)]
+        for i, s in enumerate(ref_station):
+            ref_seq[s].append(i)
+        ref_solution = (ref_station, ref_seq, ref_tool)
+    ref_bits = []
+    station_assignment, station_sequences, tool_assignment = ref_solution
+    for task in range(NUM_TASKS):
+        cs = station_assignment[task]
+        for s in range(NUM_STATIONS):
+            ref_bits.append(1 if s == cs else 0)
+    for task in range(NUM_TASKS):
+        ct = tool_assignment[task]
+        for tt in range(NUM_TOOL_TYPES):
+            ref_bits.append(1 if tt == ct else 0)
+    for task in range(NUM_TASKS):
+        s = station_assignment[task]
+        seq = station_sequences[s]
+        if task in seq and len(seq) > 0:
+            rk = seq.index(task)
+            ref_bits.append(1 if rk >= len(seq) / 2 else 0)
+        else:
+            ref_bits.append(0)
+    ref_bits = np.array(ref_bits, int)
+    base_angle = 0.03 * np.pi * np.exp(-t / (max_iter / 2))
+    archive_size = len(guided_archive)
+    p_mut_min, p_mut_max = 0.006, 0.06
+    size_factor = 1.0 / (1.0 + np.log1p(max(archive_size, 1)))
+    p_mut = p_mut_min + (p_mut_max - p_mut_min) * (1 - progress) * size_factor
+    phi_max = (0.04 * np.pi) * (1 - progress) + 0.02 * np.pi
+    p_reinit, p_flip = 0.4 * p_mut, 0.4 * p_mut
+    update_indices = np.random.choice(pop_size, size=valid_size, replace=False)
+    for idx in range(valid_size):
+        j = update_indices[idx]
+        for i in range(num_qubits):
+            alpha, beta = Q[j, i]
+            xi = X_obs[idx, i]
+            ri = ref_bits[i]
+            if xi == ri:
+                direction = 1.0 if np.random.rand() < 0.7 else -1.0
+            else:
+                direction = 1.0 if ri == 1 else -1.0
+            theta = base_angle * direction
+            c, s = np.cos(theta), np.sin(theta)
+            new_alpha = c * alpha - s * beta
+            new_beta = s * alpha + c * beta
+            norm = np.hypot(new_alpha, new_beta)
+            if norm < EPS:
+                new_alpha, new_beta = alpha, beta
+                norm = np.hypot(new_alpha, new_beta)
+            new_alpha /= norm
+            new_beta /= norm
+            p1 = float(abs(new_beta) ** 2)
+            polarization = abs(p1 - 0.5)
+            boost = 1.0 + 1.5 * max(0.0, polarization - 0.25)
+            if np.random.rand() < p_mut * boost:
+                r = np.random.rand()
+                if r < p_reinit:
+                    new_alpha = new_beta = 1 / np.sqrt(2)
+                elif r < p_reinit + p_flip:
+                    new_alpha, new_beta = new_beta, new_alpha
+                    jitter = np.random.uniform(-0.01 * np.pi, 0.01 * np.pi)
+                    c2, s2 = np.cos(jitter), np.sin(jitter)
+                    new_alpha, new_beta = c2 * new_alpha - s2 * new_beta, s2 * new_alpha + c2 * new_beta
+                else:
+                    delta = np.random.uniform(-phi_max, phi_max)
+                    c2, s2 = np.cos(delta), np.sin(delta)
+                    new_alpha, new_beta = c2 * new_alpha - s2 * new_beta, s2 * new_alpha + c2 * new_beta
+                norm = np.hypot(new_alpha, new_beta)
+                if norm < EPS:
+                    new_alpha, new_beta = 1 / np.sqrt(2), 1 / np.sqrt(2)
+                else:
+                    new_alpha /= norm
+                    new_beta /= norm
+            new_Q[j, i, 0] = new_alpha
+            new_Q[j, i, 1] = new_beta
+    return new_Q
+
+
+# 6. Local improvement with instrumentation
+def local_qloss_improvement(solution, obj_values):
+    station_assignment, station_sequences, tool_assignment = solution
+    ct, load_std, qloss = obj_values
+    improved = False
+    new_tool_assignment = tool_assignment.copy()
+    eval_count = 0
+    for task in range(NUM_TASKS):
+        original_tool = tool_assignment[task]
+        allowed_tools = list(ALLOWED_TOOLS[task])
+        if len(allowed_tools) <= 1:
+            continue
+        for new_tool in allowed_tools:
+            if new_tool == original_tool:
+                continue
+            test_tool_assignment = new_tool_assignment.copy()
+            test_tool_assignment[task] = new_tool
+            test_solution = (station_assignment, station_sequences, test_tool_assignment)
+            test_obj, _, _ = evaluate_welding_objectives_with_penalty(test_solution)
+            eval_count += 1
+            test_ct, test_std, test_qloss = test_obj
+            ct_ok = test_ct <= ct + EPS_CT
+            std_ok = test_std <= load_std + EPS_STD
+            qloss_improved = test_qloss < qloss - EPS
+            if ct_ok and std_ok and qloss_improved:
+                new_tool_assignment = test_tool_assignment
+                ct, load_std, qloss = test_ct, test_std, test_qloss
+                improved = True
+                break
+    if improved:
+        improved_solution = (station_assignment, station_sequences, new_tool_assignment)
+        improved_obj = (ct, load_std, qloss)
+        return improved_solution, improved_obj, True, eval_count
+    return solution, obj_values, False, eval_count
+
+
+# 7. Utilities
+def has_empty_station(solution) -> bool:
+    _, station_sequences, _ = solution
+    return any(len(seq) == 0 for seq in station_sequences)
+
+
+def compute_station_times(solution):
+    station_assignment, station_sequences, tool_assignment = solution
+    station_times = np.zeros(NUM_STATIONS, dtype=float)
+    for s in range(NUM_STATIONS):
+        seq = station_sequences[s]
+        if not seq:
+            continue
+        station_times[s] += TASK_TIMES[seq[0]]
+        prev_tool = tool_assignment[seq[0]]
+        for t in seq[1:]:
+            curr_tool = tool_assignment[t]
+            station_times[s] += TASK_TIMES[t]
+            if curr_tool != prev_tool:
+                station_times[s] += TOOL_SWITCH_COST_MATRIX[prev_tool, curr_tool]
+            prev_tool = curr_tool
+    return station_times
+
+
+def round_obj(obj, decimals=12):
+    return tuple(np.round(np.asarray(obj, dtype=float), decimals=decimals).tolist())
+
+
+def strict_filter_unique(points: List[Tuple[float, float, float]]):
+    unique_points = list(dict.fromkeys(round_obj(p) for p in points))
+    front = []
+    for i, p in enumerate(unique_points):
+        dominated = False
+        for j, q in enumerate(unique_points):
+            if i != j and strict_dominates(q, p):
+                dominated = True
+                break
+        if not dominated:
+            front.append(tuple(map(float, p)))
+    front.sort(key=lambda x: (x[0], x[1], x[2]))
+    return front
+
+
+def extract_strict_front_from_archive(archive):
+    objs = [obj for _, obj in archive]
+    return strict_filter_unique(objs)
+
+
+# 8. Exact HV / IGD
+def normalize_points(points, mins, maxs):
+    points = np.asarray(points, dtype=float)
+    mins = np.asarray(mins, dtype=float)
+    maxs = np.asarray(maxs, dtype=float)
+    denom = np.maximum(maxs - mins, EPS)
+    return (points - mins) / denom
+
+
+def hv_2d_min(points_2d, ref=(1.1, 1.1)):
+    if len(points_2d) == 0:
+        return 0.0
+    pts = np.asarray(points_2d, dtype=float)
+    pts = pts[(pts[:, 0] < ref[0]) & (pts[:, 1] < ref[1])]
+    if len(pts) == 0:
+        return 0.0
+    keep = []
+    for i in range(len(pts)):
+        dominated = False
+        for j in range(len(pts)):
+            if i != j and np.all(pts[j] <= pts[i] + EPS) and np.any(pts[j] < pts[i] - EPS):
+                dominated = True
+                break
+        if not dominated:
+            keep.append(pts[i])
+    pts = np.array(keep)
+    pts = pts[np.argsort(pts[:, 0])]
+    hv = 0.0
+    prev_z = ref[1]
+    for y, z in pts:
+        if z < prev_z - EPS:
+            hv += (ref[0] - y) * (prev_z - z)
+            prev_z = z
+    return float(max(hv, 0.0))
+
+
+def hv_3d_min(points_3d, ref=(1.1, 1.1, 1.1)):
+    if len(points_3d) == 0:
+        return 0.0
+    pts = np.asarray(points_3d, dtype=float)
+    pts = pts[(pts[:, 0] < ref[0]) & (pts[:, 1] < ref[1]) & (pts[:, 2] < ref[2])]
+    if len(pts) == 0:
+        return 0.0
+    keep = []
+    for i in range(len(pts)):
+        dominated = False
+        for j in range(len(pts)):
+            if i != j and np.all(pts[j] <= pts[i] + EPS) and np.any(pts[j] < pts[i] - EPS):
+                dominated = True
+                break
+        if not dominated:
+            keep.append(pts[i])
+    pts = np.array(keep)
+    pts = pts[np.argsort(pts[:, 0])]
+    hv = 0.0
+    n = len(pts)
+    x_values = list(pts[:, 0]) + [ref[0]]
+    for i in range(n):
+        x_i = x_values[i]
+        x_next = x_values[i + 1]
+        width = x_next - x_i
+        if width <= EPS:
+            continue
+        yz = pts[: i + 1, 1:]
+        area = hv_2d_min(yz, ref=(ref[1], ref[2]))
+        hv += width * area
+    return float(max(hv, 0.0))
+
+
+def igd(points, ref_set):
+    if len(points) == 0 or len(ref_set) == 0:
+        return np.inf
+    P = np.asarray(points, dtype=float)
+    R = np.asarray(ref_set, dtype=float)
+    total = 0.0
+    for r in R:
+        d = np.linalg.norm(P - r, axis=1)
+        total += float(np.min(d))
+    return total / len(R)
+
+
+# 9. IQEA main loop with instrumentation
+def quantum_evolutionary_optimization(pop_size=30, max_iter=100, n_obs_base=3, verbose=False):
+    num_qubits = NUM_TASKS * (NUM_STATIONS + NUM_TOOL_TYPES + 1)
+    Q = np.zeros((pop_size, num_qubits, 2))
+    Q[:, :, 0] = Q[:, :, 1] = 1 / np.sqrt(2)
+    pareto_archive = []
+    history = {
+        'best_ct': [],
+        'best_load_std': [],
+        'best_qloss': [],
+        'archive_size': [],
+    }
+    stats = {
+        'objective_evaluations': 0,
+        'local_improvement_calls': 0,
+        'local_improvement_successes': 0,
+        'local_improvement_evaluations': 0,
+        'local_improvement_time_sec': 0.0,
+    }
+    t0 = time.perf_counter()
+    for t in range(max_iter):
+        solutions = []
+        original_objs = []
+        penalized_objs = []
+        X_obs = []
+        progress = t / max_iter
+        n_obs = n_obs_base + int(2 * progress) if progress < 1.0 else n_obs_base + 2
+        for j in range(pop_size):
+            sol, obs_bits, orig_obj = observe_individual(Q[j], n_obs)
+            stats['objective_evaluations'] += n_obs
+            _, penalized_obj, _ = evaluate_welding_objectives_with_penalty(sol)
+            stats['objective_evaluations'] += 1
+            if not has_empty_station(sol):
+                solutions.append(sol)
+                original_objs.append(orig_obj)
+                penalized_objs.append(penalized_obj)
+                X_obs.append(obs_bits)
+        X_obs = np.array(X_obs) if X_obs else np.empty((0, num_qubits))
+        for sol, orig_obj in zip(solutions, original_objs):
+            if not np.any(np.isinf(orig_obj)):
+                pareto_archive = update_archive(pareto_archive, sol, orig_obj)
+        if progress > 0.7 and pareto_archive:
+            improved_archive = []
+            for sol, obj in pareto_archive:
+                stats['local_improvement_calls'] += 1
+                t_ls0 = time.perf_counter()
+                improved_sol, improved_obj, improved, n_eval = local_qloss_improvement(sol, obj)
+                stats['local_improvement_time_sec'] += time.perf_counter() - t_ls0
+                stats['local_improvement_evaluations'] += n_eval
+                stats['objective_evaluations'] += n_eval
+                if improved:
+                    stats['local_improvement_successes'] += 1
+                improved_archive.append((improved_sol, improved_obj))
+            pareto_archive = improved_archive
+        if pareto_archive:
+            archive_objs = np.array([obj for _, obj in pareto_archive])
+            history['best_ct'].append(archive_objs[:, 0].min())
+            history['best_load_std'].append(archive_objs[:, 1].min())
+            history['best_qloss'].append(archive_objs[:, 2].min())
+        else:
+            history['best_ct'].append(np.inf)
+            history['best_load_std'].append(np.inf)
+            history['best_qloss'].append(np.inf)
+        history['archive_size'].append(len(pareto_archive))
+        guided_archive = [(sol, pen_obj) for sol, pen_obj in zip(solutions, penalized_objs)]
+        Q = update_Q(Q, guided_archive, X_obs, t, max_iter)
+        if verbose and (t % 10 == 0):
+            print(f"Iter {t:3d}/{max_iter:3d} | Archive={len(pareto_archive):2d} | "
+                  f"Best CT={history['best_ct'][-1]:7.2f} | Best STD={history['best_load_std'][-1]:7.2f} | "
+                  f"Best Q={history['best_qloss'][-1]:7.4f}")
+    runtime = time.perf_counter() - t0
+    stats['runtime_sec'] = runtime
+    stats['avg_archive_size'] = float(np.mean(history['archive_size'])) if history['archive_size'] else 0.0
+    stats['final_archive_size'] = len(pareto_archive)
+    stats['local_time_ratio_pct'] = 100.0 * stats['local_improvement_time_sec'] / max(runtime, EPS)
+    stats['avg_local_calls_per_iter'] = stats['local_improvement_calls'] / max(max_iter, 1)
+    stats['local_success_rate_pct'] = 100.0 * stats['local_improvement_successes'] / max(stats['local_improvement_calls'], 1)
+    return pareto_archive, history, stats
+
+
+# 10. Visualization for epsilon sensitivity
+def plot_epsilon_sensitivity_clouds(all_epsilon_fronts, epsilon_labels, out_dir):
+    """并排绘制不同 epsilon 设置下的帕累托点云（CT vs QLoss，颜色表示 LoadSTD）"""
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    n = len(epsilon_labels)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), squeeze=False)
+    axes = axes[0]
+    all_ct = []
+    all_ql = []
+    for label in epsilon_labels:
+        points = all_epsilon_fronts.get(label, [])
+        if points:
+            pts = np.array(points)
+            all_ct.extend(pts[:, 0])
+            all_ql.extend(pts[:, 2])
+    if all_ct and all_ql:
+        ct_min, ct_max = min(all_ct), max(all_ct)
+        ql_min, ql_max = min(all_ql), max(all_ql)
+        ct_pad = max(1.0, 0.05 * (ct_max - ct_min + 1e-9))
+        ql_pad = max(1e-3, 0.05 * (ql_max - ql_min + 1e-12))
+    else:
+        ct_min = ql_min = 0.0
+        ct_max = ql_max = 1.0
+        ct_pad = ql_pad = 0.1
+    for ax, label in zip(axes, epsilon_labels):
+        ax.set_title(label)
+        ax.set_xlabel("CT (s)")
+        ax.set_ylabel("QLoss")
+        points = all_epsilon_fronts.get(label, [])
+        if points:
+            pts = np.array(points)
+            ct_vals = pts[:, 0]
+            std_vals = pts[:, 1]
+            qloss_vals = pts[:, 2]
+            sc = ax.scatter(ct_vals, qloss_vals, c=std_vals, s=50, alpha=0.85,
+                            edgecolors='black', linewidths=0.4, cmap='viridis')
+            if ax is axes[0]:
+                cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label('LoadSTD (s)')
+        else:
+            ax.text(0.5, 0.5, "无非支配解", ha='center', va='center', transform=ax.transAxes)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(ct_min - ct_pad, ct_max + ct_pad)
+        ax.set_ylim(ql_min - ql_pad, ql_max + ql_pad)
+    fig.suptitle("不同 ε 容忍参数下的最终帕累托点云 (CT vs QLoss, 颜色=LoadSTD)", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plot_path = os.path.join(out_dir, 'epsilon_sensitivity_pareto_clouds.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"帕累托点云图已保存至: {plot_path}")
+
+
+def plot_hv_igd_boxplots(run_records, epsilon_labels, out_dir):
+    """绘制 HV 和 IGD 随 ε 变化的箱线图"""
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    hv_data = []
+    igd_data = []
+    for label in epsilon_labels:
+        hv_vals = [rec['HV'] for rec in run_records if rec['label'] == label and not np.isnan(rec['HV'])]
+        igd_vals = [rec['IGD'] for rec in run_records if rec['label'] == label and not np.isnan(rec['IGD'])]
+        hv_data.append(hv_vals)
+        igd_data.append(igd_vals)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    # HV boxplot
+    axes[0].boxplot(hv_data, labels=epsilon_labels, showmeans=True, meanline=True)
+    axes[0].set_xlabel("ε setting")
+    axes[0].set_ylabel("Hypervolume (HV)")
+    axes[0].set_title("不同 ε 下的超体积分布")
+    axes[0].grid(True, alpha=0.3)
+    # IGD boxplot
+    axes[1].boxplot(igd_data, labels=epsilon_labels, showmeans=True, meanline=True)
+    axes[1].set_xlabel("ε setting")
+    axes[1].set_ylabel("Inverted Generational Distance (IGD)")
+    axes[1].set_title("不同 ε 下的反世代距离分布")
+    axes[1].grid(True, alpha=0.3)
+    plt.tight_layout()
+    plot_path = os.path.join(out_dir, 'epsilon_hv_igd_boxplots.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"HV/IGD 箱线图已保存至: {plot_path}")
+
+def plot_parallel_coordinates(run_records, epsilon_labels, out_dir):
+    """绘制三目标平行坐标图（分面：每个 epsilon 一个子图）"""
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    n = len(epsilon_labels)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), sharey=False, squeeze=False)
+    axes = axes[0]
+    # 收集所有目标的范围用于统一归一化
+    all_ct, all_std, all_ql = [], [], []
+    for rec in run_records:
+        if not np.isnan(rec['CT']):
+            all_ct.append(rec['CT'])
+            all_std.append(rec['LoadSTD'])
+            all_ql.append(rec['QLoss'])
+    if not all_ct:
+        return
+    ct_min, ct_max = min(all_ct), max(all_ct)
+    std_min, std_max = min(all_std), max(all_std)
+    ql_min, ql_max = min(all_ql), max(all_ql)
+    # 归一化函数
+    def norm(v, lo, hi):
+        if hi - lo < EPS:
+            return 0.5
+        return (v - lo) / (hi - lo)
+    for ax, label in zip(axes, epsilon_labels):
+        records = [rec for rec in run_records if rec['label'] == label and not np.isnan(rec['CT'])]
+        if not records:
+            ax.text(0.5, 0.5, "无数据", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(label)
+            continue
+        # 为每条线分配透明度或颜色（这里用浅灰色，按 QLoss 映射颜色可选）
+        for rec in records:
+            ct_n = norm(rec['CT'], ct_min, ct_max)
+            std_n = norm(rec['LoadSTD'], std_min, std_max)
+            ql_n = norm(rec['QLoss'], ql_min, ql_max)
+            ax.plot(['CT', 'LoadSTD', 'QLoss'], [ct_n, std_n, ql_n],
+                    color='steelblue', alpha=0.4, linewidth=0.8)
+        # 添加平均值线
+        avg_ct = norm(np.mean([r['CT'] for r in records]), ct_min, ct_max)
+        avg_std = norm(np.mean([r['LoadSTD'] for r in records]), std_min, std_max)
+        avg_ql = norm(np.mean([r['QLoss'] for r in records]), ql_min, ql_max)
+        ax.plot(['CT', 'LoadSTD', 'QLoss'], [avg_ct, avg_std, avg_ql],
+                color='red', linewidth=2, label='Average Values')
+        ax.set_title(label)
+        ax.set_xlabel("Objective")
+        ax.set_ylabel("Normalized objective value")
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+        if ax is axes[0]:
+            ax.legend()
+    fig.suptitle("不同 ε 设置下最终解的三目标平行坐标图（归一化）", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plot_path = os.path.join(out_dir, 'epsilon_parallel_coordinates.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"平行坐标图已保存至: {plot_path}")
+
+# =========================================================
+# 11. Experiment driver (modified to include plotting)
+# =========================================================
+def format_mean_std(arr, digits=4):
+    arr = np.asarray(arr, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    if len(arr) == 0:
+        return "nan ± nan"
+    mean = np.mean(arr)
+    std = np.std(arr, ddof=1) if len(arr) > 1 else 0.0
+    return f"{mean:.{digits}f} ± {std:.{digits}f}"
+
+def run_epsilon_sensitivity(
+        epsilon_settings: List[Tuple[str, float, float]],
+        num_runs: int = 20,
+        pop_size: int = 30,
+        max_iter: int = 100,
+        n_obs_base: int = 3,
+        base_seed: int = 20260,
+        out_dir: str = "epsilon_sensitivity_results",
+):
+    os.makedirs(out_dir, exist_ok=True)
+    run_records: List[Dict[str, Any]] = []
+    all_fronts_for_ref: List[Tuple[str, int, List[Tuple[float, float, float]]]] = []
+    epsilon_merged_fronts: Dict[str, List[Tuple[float, float, float]]] = {}
+
+    for label, eps_ct, eps_std in epsilon_settings:
+        print("=" * 90)
+        print(f"[Setting] {label}: EPS_CT={eps_ct}, EPS_STD={eps_std}, EPS_Q=0")
+        set_epsilon(eps_ct, eps_std)
+        all_points_for_label = []
+        for run in range(1, num_runs + 1):
+            seed = base_seed + run
+            random.seed(seed)
+            np.random.seed(seed)
+            archive, history, stats = quantum_evolutionary_optimization(
+                pop_size=pop_size, max_iter=max_iter, n_obs_base=n_obs_base, verbose=False,
+            )
+            strict_front = extract_strict_front_from_archive(archive)
+            all_fronts_for_ref.append((label, run, strict_front))
+            all_points_for_label.extend(strict_front)
+            final_sol, final_obj, _ = select_final_solution_majority(archive)
+            if final_obj is None:
+                ct_f, std_f, ql_f = np.nan, np.nan, np.nan
+            else:
+                ct_f, std_f, ql_f = final_obj
+            run_records.append({
+                'label': label, 'run': run, 'EPS_CT': eps_ct, 'EPS_STD': eps_std,
+                'CT': ct_f, 'LoadSTD': std_f, 'QLoss': ql_f,
+                'runtime_sec': stats['runtime_sec'],
+                'objective_evaluations': stats['objective_evaluations'],
+                'avg_archive_size': stats['avg_archive_size'],
+                'final_archive_size': stats['final_archive_size'],
+                'local_improvement_calls': stats['local_improvement_calls'],
+                'local_improvement_successes': stats['local_improvement_successes'],
+                'local_improvement_evaluations': stats['local_improvement_evaluations'],
+                'local_improvement_time_sec': stats['local_improvement_time_sec'],
+                'local_time_ratio_pct': stats['local_time_ratio_pct'],
+                'avg_local_calls_per_iter': stats['avg_local_calls_per_iter'],
+                'local_success_rate_pct': stats['local_success_rate_pct'],
+                'strict_front_size': len(strict_front),
+                'strict_front': strict_front,
+            })
+            print(f"  Run {run:02d}/{num_runs:02d} | CT={ct_f:.2f} | STD={std_f:.2f} | Q={ql_f:.4f} | "
+                  f"Front={len(strict_front):2d} | Runtime={stats['runtime_sec']:.2f}s")
+        if all_points_for_label:
+            merged_front = strict_filter_unique(all_points_for_label)
+        else:
+            merged_front = []
+        epsilon_merged_fronts[label] = merged_front
+        print(f"  合并后的前沿大小: {len(merged_front)}")
+
+    # Build common reference set
+    union_points = []
+    for _, _, front in all_fronts_for_ref:
+        union_points.extend(front)
+    if len(union_points) == 0:
+        raise RuntimeError("All strict fronts are empty. Cannot build a reference set.")
+    reference_set = strict_filter_unique(union_points)
+    mins = np.min(np.asarray(reference_set, dtype=float), axis=0)
+    maxs = np.max(np.asarray(reference_set, dtype=float), axis=0)
+
+    # Compute HV/IGD per run
+    ref_norm = normalize_points(reference_set, mins, maxs)
+    for rec in run_records:
+        strict_front = rec['strict_front']
+        if len(strict_front) == 0:
+            rec['HV'] = np.nan
+            rec['IGD'] = np.nan
+            continue
+        front_norm = normalize_points(strict_front, mins, maxs)
+        rec['HV'] = hv_3d_min(front_norm, ref=(1.1, 1.1, 1.1))
+        rec['IGD'] = igd(front_norm, ref_norm)
+
+    # Save run-level CSV
+    run_csv = os.path.join(out_dir, 'epsilon_sensitivity_run_details.csv')
+    with open(run_csv, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'label', 'run', 'EPS_CT', 'EPS_STD',
+            'CT', 'LoadSTD', 'QLoss', 'HV', 'IGD',
+            'runtime_sec', 'objective_evaluations',
+            'avg_archive_size', 'final_archive_size', 'strict_front_size',
+            'local_improvement_calls', 'local_improvement_successes',
+            'local_improvement_evaluations', 'local_improvement_time_sec',
+            'local_time_ratio_pct', 'avg_local_calls_per_iter', 'local_success_rate_pct'
+        ])
+        for rec in run_records:
+            writer.writerow([
+                rec['label'], rec['run'], rec['EPS_CT'], rec['EPS_STD'],
+                rec['CT'], rec['LoadSTD'], rec['QLoss'], rec['HV'], rec['IGD'],
+                rec['runtime_sec'], rec['objective_evaluations'],
+                rec['avg_archive_size'], rec['final_archive_size'], rec['strict_front_size'],
+                rec['local_improvement_calls'], rec['local_improvement_successes'],
+                rec['local_improvement_evaluations'], rec['local_improvement_time_sec'],
+                rec['local_time_ratio_pct'], rec['avg_local_calls_per_iter'], rec['local_success_rate_pct']
+            ])
+
+    # Summary table
+    summary_rows = []
+    for label, eps_ct, eps_std in epsilon_settings:
+        subset = [r for r in run_records if r['label'] == label]
+        row = {
+            'label': label, 'EPS_CT': eps_ct, 'EPS_STD': eps_std,
+            'CT_mean_std': format_mean_std([r['CT'] for r in subset], 2),
+            'LoadSTD_mean_std': format_mean_std([r['LoadSTD'] for r in subset], 2),
+            'QLoss_mean_std': format_mean_std([r['QLoss'] for r in subset], 4),
+            'HV_mean_std': format_mean_std([r['HV'] for r in subset], 4),
+            'IGD_mean_std': format_mean_std([r['IGD'] for r in subset], 4),
+            'Runtime_mean_std': format_mean_std([r['runtime_sec'] for r in subset], 2),
+            'ObjEval_mean_std': format_mean_std([r['objective_evaluations'] for r in subset], 1),
+            'AvgArchive_mean_std': format_mean_std([r['avg_archive_size'] for r in subset], 2),
+            'FinalArchive_mean_std': format_mean_std([r['final_archive_size'] for r in subset], 2),
+            'LocalCalls_mean_std': format_mean_std([r['local_improvement_calls'] for r in subset], 2),
+            'LocalTimePct_mean_std': format_mean_std([r['local_time_ratio_pct'] for r in subset], 2),
+            'LocalSuccessPct_mean_std': format_mean_std([r['local_success_rate_pct'] for r in subset], 2),
+        }
+        summary_rows.append(row)
+
+    summary_csv = os.path.join(out_dir, 'epsilon_sensitivity_summary.csv')
+    with open(summary_csv, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'label', 'EPS_CT', 'EPS_STD',
+            'CT (mean±std)', 'LoadSTD (mean±std)', 'QLoss (mean±std)',
+            'HV (mean±std)', 'IGD (mean±std)',
+            'Runtime_s (mean±std)', 'ObjectiveEvaluations (mean±std)',
+            'AvgArchiveSize (mean±std)', 'FinalArchiveSize (mean±std)',
+            'LocalImprovementCalls (mean±std)', 'LocalTimeRatioPct (mean±std)',
+            'LocalSuccessRatePct (mean±std)'
+        ])
+        for row in summary_rows:
+            writer.writerow([
+                row['label'], row['EPS_CT'], row['EPS_STD'],
+                row['CT_mean_std'], row['LoadSTD_mean_std'], row['QLoss_mean_std'],
+                row['HV_mean_std'], row['IGD_mean_std'],
+                row['Runtime_mean_std'], row['ObjEval_mean_std'],
+                row['AvgArchive_mean_std'], row['FinalArchive_mean_std'],
+                row['LocalCalls_mean_std'], row['LocalTimePct_mean_std'],
+                row['LocalSuccessPct_mean_std'],
+            ])
+
+    # Reference details
+    norm_csv = os.path.join(out_dir, 'epsilon_reference_details.csv')
+    with open(norm_csv, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Metric', 'Value'])
+        writer.writerow(['ReferenceSetSize', len(reference_set)])
+        writer.writerow(['CT_min', float(mins[0])])
+        writer.writerow(['CT_max', float(maxs[0])])
+        writer.writerow(['LoadSTD_min', float(mins[1])])
+        writer.writerow(['LoadSTD_max', float(maxs[1])])
+        writer.writerow(['QLoss_min', float(mins[2])])
+        writer.writerow(['QLoss_max', float(maxs[2])])
+        writer.writerow(['HV_reference_point', '(1.1, 1.1, 1.1)'])
+        writer.writerow(['IGD_reference_set_construction',
+                         'Union of strict nondominated fronts from all epsilon settings and all runs'])
+
+    # Generate plots
+    epsilon_labels = [label for label, _, _ in epsilon_settings]
+    plot_epsilon_sensitivity_clouds(epsilon_merged_fronts, epsilon_labels, out_dir)
+    plot_hv_igd_boxplots(run_records, epsilon_labels, out_dir)
+    plot_parallel_coordinates(run_records, epsilon_labels, out_dir)
+
+    print("\n" + "#" * 90)
+    print("ε-sensitivity summary (directly usable for the paper)")
+    for row in summary_rows:
+        print(
+            f"{row['label']} | ε=({row['EPS_CT']}, {row['EPS_STD']}, 0) | "
+            f"HV={row['HV_mean_std']} | IGD={row['IGD_mean_std']} | "
+            f"Runtime={row['Runtime_mean_std']} | AvgArchive={row['AvgArchive_mean_std']}"
+        )
+    print("#" * 90)
+    print(f"Run-level CSV   : {run_csv}")
+    print(f"Summary CSV     : {summary_csv}")
+    print(f"Reference details: {norm_csv}")
+
+    return {
+        'run_records': run_records,
+        'summary_rows': summary_rows,
+        'reference_set': reference_set,
+        'normalization_bounds': {'mins': mins, 'maxs': maxs},
+        'run_csv': run_csv,
+        'summary_csv': summary_csv,
+        'norm_csv': norm_csv,
+        'epsilon_merged_fronts': epsilon_merged_fronts,
+    }
+
+
+# 12. Main entry
+def get_environment_info():
+    return {
+        "python_version": sys.version.replace("\n", " "),
+        "platform": platform.platform(),
+        "processor": platform.processor(),
+        "machine": platform.machine(),
+        "numpy_version": np.__version__,
+    }
+
+def save_environment_info(out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "environment_info.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(get_environment_info(), f, indent=2, ensure_ascii=False)
+    return path
+
+def parse_epsilon_settings(text: str):
+    settings = []
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        label, ct, std = item.split(":")
+        settings.append((label.strip(), float(ct), float(std)))
+    return settings
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="GitHub-ready epsilon sensitivity experiment for the welding-line three-objective IQEA."
+    )
+    parser.add_argument(
+        "--epsilon-settings",
+        type=str,
+        default="eps_025:0.25:0.125,eps_05:0.50:0.25,eps_1:1.00:0.50,eps_2:2.00:1.00",
+        help="Comma-separated label:eps_ct:eps_std triples.",
+    )
+    parser.add_argument("--num-runs", type=int, default=20)
+    parser.add_argument("--pop-size", type=int, default=30)
+    parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument("--n-obs-base", type=int, default=3)
+    parser.add_argument("--base-seed", type=int, default=20260)
+    parser.add_argument("--out-dir", type=str, default="results/iqea_epsilon_sensitivity")
+    parser.add_argument("--no-plots", action="store_true")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    epsilon_settings = parse_epsilon_settings(args.epsilon_settings)
+    os.makedirs(args.out_dir, exist_ok=True)
+    env_path = save_environment_info(args.out_dir)
+
+    if args.no_plots:
+        globals()["plot_epsilon_sensitivity_clouds"] = lambda *a, **k: None
+        globals()["plot_hv_igd_boxplots"] = lambda *a, **k: None
+        globals()["plot_parallel_coordinates"] = lambda *a, **k: None
+
+    results = run_epsilon_sensitivity(
+        epsilon_settings=epsilon_settings,
+        num_runs=args.num_runs,
+        pop_size=args.pop_size,
+        max_iter=args.max_iter,
+        n_obs_base=args.n_obs_base,
+        base_seed=args.base_seed,
+        out_dir=args.out_dir,
+    )
+
+    config_path = os.path.join(args.out_dir, "experiment_config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "epsilon_settings": epsilon_settings,
+                "num_runs": args.num_runs,
+                "pop_size": args.pop_size,
+                "max_iter": args.max_iter,
+                "n_obs_base": args.n_obs_base,
+                "base_seed": args.base_seed,
+                "out_dir": args.out_dir,
+                "plots_enabled": not args.no_plots,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print("=" * 90)
+    print("IQEA epsilon sensitivity experiment completed.")
+    print(f"Output directory : {os.path.abspath(args.out_dir)}")
+    print(f"Run details CSV  : {results['run_csv']}")
+    print(f"Summary CSV      : {results['summary_csv']}")
+    print(f"Reference CSV    : {results['norm_csv']}")
+    print(f"Environment JSON : {env_path}")
+    print(f"Config JSON      : {config_path}")
+    print("=" * 90)
+
+if __name__ == "__main__":
+    main()
