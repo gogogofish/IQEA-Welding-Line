@@ -1,15 +1,5 @@
-import argparse
-import csv
-import json
-import os
-import platform
-import sys
-from pathlib import Path
-
 import numpy as np
 import random
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from mpl_toolkits.mplot3d import Axes3D
@@ -62,7 +52,7 @@ EPS = 1e-12  # 数值计算精度控制
 
 # ==== ε-支配参数 ====
 EPS_CT = 0.5  # 降低生产节拍的ε容差
-EPS_STD = 0.2  # 降低负载标准差的ε容差
+EPS_STD = 0.25  # 降低负载标准差的ε容差
 
 # ==== 档案大小限制 ====
 MAX_ARCHIVE_SIZE = 20
@@ -71,9 +61,9 @@ MAX_ARCHIVE_SIZE = 20
 QUAL_ALPHA = 0.2  # 粗糙度权重系数
 QUAL_BETA = 0.5  # 缺陷率权重系数
 QUAL_GAMMA = 0.3  # 膨胀量权重系数
-TARGET_EXPANSION = 0.05  # 目标膨胀量（工艺要求）
-POSITIVE_WEIGHT = 1.0  # 膨胀量正偏差权重（过度膨胀惩罚更重）
-NEGATIVE_WEIGHT = 0.6  # 膨胀量负偏差权重（收缩惩罚较轻）
+TARGET_EXPANSION = 0.025  # 目标膨胀量（
+POSITIVE_WEIGHT = 1.5  # 膨胀量正偏差权重
+NEGATIVE_WEIGHT = 0.8  # 膨胀量负偏差权重
 
 # ==== CT阈值参数 ====
 MAX_CT_THRESHOLD = 600.0  # 生产节拍最大允许阈值
@@ -294,7 +284,7 @@ def update_archive(archive, cand_solution, cand_obj):
 
 
 def select_representative_solutions(pareto_archive):
-    """从帕累托档案中选择参考解（理想点、膝点）"""
+    """从帕累托档案中选择参考解"""
     reps = []
     if not pareto_archive:
         return reps
@@ -792,6 +782,7 @@ def plot_statistical_comparison(results):
         axes[1, 0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
                         f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
 
+
     plt.tight_layout()
     plt.show()
 
@@ -884,241 +875,7 @@ def print_summary_statistics(results):
     print("\n" + "=" * 80)
 
 
-# ==== 11. GitHub复现包辅助模块 ====
-def get_environment_info():
-    return {
-        "python_version": sys.version.replace("\n", " "),
-        "platform": platform.platform(),
-        "processor": platform.processor(),
-        "machine": platform.machine(),
-        "numpy_version": np.__version__,
-        "matplotlib_version": plt.matplotlib.__version__,
-    }
-
-def save_environment_info(out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "environment_info.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(get_environment_info(), f, indent=2, ensure_ascii=False)
-    return path
-
-def save_current_fig(save_path):
-    fig = plt.gcf()
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-def run_mode_experiment_github(mode_names, num_runs=30, pop_size=30, max_iter=100, n_obs_base=3, base_seed=2025):
-    all_results = {}
-    rows = []
-
-    for mode_idx, mode_name in enumerate(mode_names):
-        mode_results = {
-            'histories': [],
-            'pareto_archives': [],
-            'run_metrics': []
-        }
-
-        print(f"\n>>> 开始测试变异模式: {mode_name}")
-        print("-" * 60)
-
-        for run in range(num_runs):
-            seed = int(base_seed + mode_idx * 100000 + run)
-            np.random.seed(seed)
-            random.seed(seed)
-
-            pareto_archive, history = quantum_evolutionary_optimization(
-                pop_size=pop_size,
-                max_iter=max_iter,
-                n_obs_base=n_obs_base,
-                mutation_mode=mode_name
-            )
-
-            mode_results['histories'].append(history)
-            mode_results['pareto_archives'].append(pareto_archive)
-
-            if pareto_archive:
-                archive_objs = np.array([obj for _, obj in pareto_archive], dtype=float)
-                best_ct = float(np.min(archive_objs[:, 0]))
-                best_std = float(np.min(archive_objs[:, 1]))
-                best_qloss = float(np.min(archive_objs[:, 2]))
-                archive_size = int(len(pareto_archive))
-            else:
-                best_ct = float("inf")
-                best_std = float("inf")
-                best_qloss = float("inf")
-                archive_size = 0
-
-            row = {
-                "mutation_mode": mode_name,
-                "run": run + 1,
-                "seed": seed,
-                "best_ct": best_ct,
-                "best_std": best_std,
-                "best_qloss": best_qloss,
-                "archive_size": archive_size,
-                "final_ct_history": float(history["best_ct"][-1]) if history["best_ct"] else float("inf"),
-                "final_std_history": float(history["best_load_std"][-1]) if history["best_load_std"] else float("inf"),
-                "final_qloss_history": float(history["best_qloss"][-1]) if history["best_qloss"] else float("inf"),
-            }
-            rows.append(row)
-            mode_results['run_metrics'].append(row)
-
-            print(
-                f"Run {run + 1:02d}/{num_runs:02d} | "
-                f"CT={best_ct:.2f}, LoadSTD={best_std:.2f}, QLoss={best_qloss:.4f}, "
-                f"|archive|={archive_size}"
-            )
-
-        all_results[mode_name] = mode_results
-        print(f"✓ {mode_name} 完成 {num_runs} 次运行")
-
-    return all_results, rows
-
-def save_run_results_csv(rows, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "mutation_mode_run_results.csv")
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "mutation_mode", "run", "seed", "best_ct", "best_std", "best_qloss",
-            "archive_size", "final_ct_history", "final_std_history", "final_qloss_history"
-        ])
-        writer.writeheader()
-        writer.writerows(rows)
-    return path
-
-def save_summary_csv(rows, out_dir):
-    import pandas as pd
-    os.makedirs(out_dir, exist_ok=True)
-    df = pd.DataFrame(rows)
-    summary = df.groupby("mutation_mode").agg(
-        n_runs=("run", "count"),
-        best_ct_mean=("best_ct", "mean"),
-        best_ct_std=("best_ct", "std"),
-        best_std_mean=("best_std", "mean"),
-        best_std_std=("best_std", "std"),
-        best_qloss_mean=("best_qloss", "mean"),
-        best_qloss_std=("best_qloss", "std"),
-        archive_size_mean=("archive_size", "mean"),
-        archive_size_std=("archive_size", "std"),
-    ).reset_index()
-    path = os.path.join(out_dir, "mutation_mode_summary.csv")
-    summary.to_csv(path, index=False, encoding="utf-8-sig")
-    return path
-
-def save_convergence_history_csv(all_results, out_dir):
-    import pandas as pd
-    rows = []
-    for mode_name, mode_results in all_results.items():
-        for run_idx, history in enumerate(mode_results["histories"], start=1):
-            n_iter = len(history["best_ct"])
-            for i in range(n_iter):
-                rows.append({
-                    "mutation_mode": mode_name,
-                    "run": run_idx,
-                    "iteration": i + 1,
-                    "best_ct": float(history["best_ct"][i]),
-                    "best_load_std": float(history["best_load_std"][i]),
-                    "best_qloss": float(history["best_qloss"][i]),
-                    "archive_size": int(history["archive_size"][i]),
-                })
-    df = pd.DataFrame(rows)
-    path = os.path.join(out_dir, "mutation_mode_convergence_history.csv")
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-    return path
-
-def save_final_pareto_archives(all_results, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "mutation_mode_all_pareto_archives.csv")
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["mutation_mode", "run", "solution_idx", "CT", "LoadSTD", "QLoss", "station_loads"])
-        for mode_name, mode_results in all_results.items():
-            for run_idx, archive in enumerate(mode_results["pareto_archives"], start=1):
-                for sol_idx, (sol, obj) in enumerate(archive, start=1):
-                    station_loads = compute_station_times(sol)
-                    writer.writerow([
-                        mode_name,
-                        run_idx,
-                        sol_idx,
-                        float(obj[0]),
-                        float(obj[1]),
-                        float(obj[2]),
-                        "[" + ",".join([f"{x:.6f}" for x in station_loads.tolist()]) + "]"
-                    ])
-    return path
-
-def save_experiment_config(out_dir, config):
-    path = os.path.join(out_dir, "experiment_config.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-    return path
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="GitHub-ready reproducibility script for the IQEA mutation-mode comparison experiment."
-    )
-    parser.add_argument("--modes", type=str,
-                        default="mode1 (50-40-10),mode2 (50-30-20),mode3 (40-40-20),mode4 (40-30-30)")
-    parser.add_argument("--num-runs", type=int, default=30)
-    parser.add_argument("--pop-size", type=int, default=30)
-    parser.add_argument("--max-iter", type=int, default=100)
-    parser.add_argument("--n-obs-base", type=int, default=3)
-    parser.add_argument("--base-seed", type=int, default=2025)
-    parser.add_argument("--out-dir", type=str, default="results/iqea_mutation_mode_comparison")
-    parser.add_argument("--no-plots", action="store_true")
-    return parser.parse_args()
-
-def main():
-    args = parse_args()
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    mode_names = [x.strip() for x in args.modes.split(",") if x.strip()]
-
-    print("=" * 70)
-    print("焊装线三目标IQEA算法 - 变异模式对比实验（GitHub复现版）")
-    print(f"模式配置：{mode_names}")
-    print(f"每种模式运行次数：{args.num_runs}")
-    print("=" * 70)
-
-    all_results, rows = run_mode_experiment_github(
-        mode_names=mode_names,
-        num_runs=args.num_runs,
-        pop_size=args.pop_size,
-        max_iter=args.max_iter,
-        n_obs_base=args.n_obs_base,
-        base_seed=args.base_seed,
-    )
-
-    run_csv = save_run_results_csv(rows, str(out_dir))
-    summary_csv = save_summary_csv(rows, str(out_dir))
-    history_csv = save_convergence_history_csv(all_results, str(out_dir))
-    archive_csv = save_final_pareto_archives(all_results, str(out_dir))
-    env_json = save_environment_info(str(out_dir))
-    config_json = save_experiment_config(str(out_dir), {
-        "mode_names": mode_names,
-        "num_runs": args.num_runs,
-        "pop_size": args.pop_size,
-        "max_iter": args.max_iter,
-        "n_obs_base": args.n_obs_base,
-        "base_seed": args.base_seed,
-        "plots_enabled": not args.no_plots,
-    })
-
-    if not args.no_plots:
-        plot_comparison_results(all_results)
-        save_current_fig(out_dir / "mutation_mode_comparison_detailed.png")
-
-        plot_statistical_comparison(all_results)
-        save_current_fig(out_dir / "mutation_mode_comparison_statistics.png")
-
-    print("\n实验完成！")
-    print(f"运行结果: {run_csv}")
-    print(f"汇总结果: {summary_csv}")
-    print(f"收敛历史: {history_csv}")
-    print(f"Pareto前沿: {archive_csv}")
-    print(f"环境信息: {env_json}")
-    print(f"实验配置: {config_json}")
-
+# ==== 主程序入口 ====
 if __name__ == "__main__":
-    main()
+    # 运行对比实验
+    run_comparison_experiment()
