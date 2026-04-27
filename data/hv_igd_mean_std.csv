@@ -13,7 +13,7 @@ IQEA_PATH = r"C:\iqea_data\iqea_20runs_all_fronts.csv"
 MOPSO_PATH = r"C:\mopso_data\combined_front_all_runs.csv"
 NSGAII_PATH = r"C:\nsga2_data\nsga2_20runs_all_fronts.csv"
 
-OUT_DIR = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\reference_front_results"
+OUT_DIR = r"C:reference_front_results"
 
 # HV 在归一化空间中的参考点
 HV_REF_POINT = np.array([1.1, 1.1, 1.1], dtype=float)
