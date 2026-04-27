@@ -5,7 +5,6 @@ import math
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-
 import numpy as np
 
 EPS = 1e-12
