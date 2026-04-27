@@ -10,12 +10,9 @@ import numpy as np
 
 EPS = 1e-12
 
-# =========================
-# 固定输入/输出路径
-# =========================
-IQEA_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\iqea_data\iqea_20runs_all_fronts.csv"
-MOPSO_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\mopso_data\combined_front_all_runs.csv"
-NSGAII_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\nsga2_data\nsga2_20runs_all_fronts.csv"
+IQEA_PATH = r"C:\iqea_data\iqea_20runs_all_fronts.csv"
+MOPSO_PATH = r"C:\mopso_data\combined_front_all_runs.csv"
+NSGAII_PATH = r"C:\nsga2_data\nsga2_20runs_all_fronts.csv"
 
 OUT_DIR = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\reference_front_results"
 
