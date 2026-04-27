@@ -6,7 +6,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import seaborn as sns
 import pandas as pd
 
-"""焊装线三目标IQEA算法（极化阈值实验版）
+"""焊装线三目标IQEA算法
 目标：最小化生产节拍(CT)、最小化工位负载标准差(LoadSTD)、最小化质量损失(QLoss)
 新增功能：测试不同极化阈值对算法性能的影响
 """
