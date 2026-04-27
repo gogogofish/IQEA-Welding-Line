@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 
-"""焊装线三目标IQEA算法（变异概率实验版）
+"""焊装线三目标IQEA算法
 目标：最小化生产节拍(CT)、最小化工位负载标准差(LoadSTD)、最小化质量损失(QLoss)
 功能：测试不同变异概率上限对算法性能的影响，超体积计算采用min-max归一化优化
 """
@@ -66,16 +66,12 @@ TARGET_EXPANSION = 0.025  # 目标膨胀量
 POSITIVE_WEIGHT = 1.5  # 膨胀量正偏差权重
 NEGATIVE_WEIGHT = 0.8  # 膨胀量负偏差权重
 
-# ==== CT阈值参数 ====
-MAX_CT_THRESHOLD = 600.0  # 生产节拍最大允许阈值
-
-# ==== 超体积计算专用：固定参考点（确保不同运行间可比性）====
+# ==== 超体积计算专用：固定参考点====
 HV_FIXED_REF_POINT = np.array([600.0, 100.0, 1.0])  # [CT_max, LoadSTD_max, QLoss_max]
 
 
 # ==== 1. 质量损失计算模块 ====
 def simple_quality_model(task: int, station: int, tool: int):
-    """根据任务、工位、工具计算质量参数（粗糙度、缺陷率、膨胀量）"""
     TOOL_BASE = {0: (0.8, 0.06, 0.02), 1: (0.6, 0.08, -0.01), 2: (0.5, 0.10, 0.03)}
     rb, db, eb = TOOL_BASE.get(tool, (0.7, 0.08, 0.0))
 
@@ -90,7 +86,6 @@ def simple_quality_model(task: int, station: int, tool: int):
 
 
 def calculate_quality_loss(solution) -> float:
-    """计算综合质量损失（三目标中的"质量损失"目标）"""
     station_assignment, station_sequences, tool_assignment = solution
     total_roughness = total_defect_rate = total_expansion = 0.0
 
@@ -117,7 +112,6 @@ def calculate_quality_loss(solution) -> float:
 
 # ==== 2. 多目标评估模块 ====
 def evaluate_welding_objectives_with_penalty(solution):
-    """评估三目标值（含约束违反惩罚），返回(原始目标值, 惩罚后目标值, 惩罚值)"""
     station_assignment, station_sequences, tool_assignment = solution
     penalty = 0.0
 
@@ -264,10 +258,6 @@ def dominates(a, b):
 
 def update_archive(archive, cand_solution, cand_obj):
     """更新帕累托档案，使用ε-支配"""
-    # 如果候选解CT超过阈值，直接返回原档案
-    if cand_obj[0] > MAX_CT_THRESHOLD:
-        return archive
-
     # 候选解被档案中任意解ε-支配则丢弃
     for _, obj in archive:
         if dominates(obj, cand_obj):
@@ -288,7 +278,7 @@ def update_archive(archive, cand_solution, cand_obj):
 
 
 def select_representative_solutions(pareto_archive):
-    """从帕累托档案中选择参考解（理想点、膝点）"""
+    """从帕累托档案中选择参考解"""
     reps = []
     if not pareto_archive:
         return reps
@@ -300,13 +290,10 @@ def select_representative_solutions(pareto_archive):
     ranges = np.maximum(maxs - mins, EPS)
     norm_objs = (objs - mins) / ranges
 
-    # 选择理想点（到归一化理想点[0,0,0]距离最近）
     utopia = np.zeros(3)
     d2utopia = np.linalg.norm(norm_objs - utopia, axis=1)
     idx_ideal = int(np.argmin(d2utopia))
     reps.append(("Ideal-point", pareto_archive[idx_ideal]))
-
-    # 选择膝点（到理想点→nadir点直线垂直距离最大）
     nadir = np.ones(3)
     line_dir = (nadir - utopia) / np.linalg.norm(nadir - utopia)
     projs = (norm_objs @ line_dir.reshape(-1, 1)) * line_dir.reshape(1, -1)
@@ -319,7 +306,6 @@ def select_representative_solutions(pareto_archive):
 
 # ==== 5. 量子进化更新模块 ====
 def update_Q(Q, guided_archive, X_obs, t, max_iter, p_mut_max=0.06):
-    """更新量子种群的量子态（仅基于有效解更新）"""
     pop_size, num_qubits, _ = Q.shape
     new_Q = np.copy(Q)
     valid_size = len(guided_archive)
@@ -342,7 +328,7 @@ def update_Q(Q, guided_archive, X_obs, t, max_iter, p_mut_max=0.06):
         else:
             ref_solution = random.choice(guided_archive)[0]
     else:
-        # 默认参考解（任务均匀分配）
+        # 默认参考解
         ref_station = np.array([i % NUM_STATIONS for i in range(NUM_TASKS)])
         ref_tool = np.array([min(ALLOWED_TOOLS[i]) for i in range(NUM_TASKS)])
         ref_seq = [[] for _ in range(NUM_STATIONS)]
@@ -383,13 +369,13 @@ def update_Q(Q, guided_archive, X_obs, t, max_iter, p_mut_max=0.06):
     phi_max = (0.08 * np.pi) * (1 - progress) + 0.02 * np.pi
     p_reinit, p_flip = 0.5 * p_mut, 0.5 * p_mut
 
-    # 仅对有效解对应的量子个体更新（避免索引超出）
+    # 仅对有效解对应的量子个体更新
     update_indices = np.random.choice(pop_size, size=valid_size, replace=False)
     for idx in range(valid_size):
-        j = update_indices[idx]  # 量子个体索引（在pop_size范围内）
+        j = update_indices[idx]  # 量子个体索引
         for i in range(num_qubits):
             alpha, beta = Q[j, i]
-            xi = X_obs[idx, i]  # 有效解对应的观测比特（idx在valid_size范围内）
+            xi = X_obs[idx, i]  # 有效解对应的观测比特
             ri = ref_bits[i]
 
             # 旋转门更新
@@ -501,7 +487,6 @@ def local_qloss_improvement(solution, obj_values):
 
 # ==== 7. IQEA主循环 ====
 def quantum_evolutionary_optimization(pop_size=30, max_iter=100, n_obs_base=3, p_mut_max=0.06):
-    """三目标量子进化算法主循环，返回(帕累托档案, 优化历史记录)"""
     # 初始化量子种群（等概率状态 |0⟩+|1⟩/√2）
     num_qubits = NUM_TASKS * (NUM_STATIONS + NUM_TOOL_TYPES + 1)
     Q = np.zeros((pop_size, num_qubits, 2))
@@ -538,7 +523,7 @@ def quantum_evolutionary_optimization(pop_size=30, max_iter=100, n_obs_base=3, p
                 pareto_archive = update_archive(pareto_archive, sol, orig_obj)
 
         # 在后期迭代中应用QLoss局部改进
-        if progress > 0.7:  # 最后30%的迭代
+        if progress > 0.5: 
             improved_archive = []
             for sol, obj in pareto_archive:
                 improved_sol, improved_obj = local_qloss_improvement(sol, obj)
@@ -624,7 +609,6 @@ def print_solution_details(solution, obj_values, title=""):
 
 # ==== 9. 实验分析与可视化模块 ====
 def run_mutation_experiment(p_mut_max_values, num_runs=20, pop_size=30, max_iter=100):
-    """运行变异概率实验，收集性能数据（包括迭代历史）"""
     results = []
     convergence_history = {}  # 存储收敛历史数据
 
@@ -640,7 +624,6 @@ def run_mutation_experiment(p_mut_max_values, num_runs=20, pop_size=30, max_iter
         for run in range(num_runs):
             print(f"运行 {run + 1}/{num_runs}...")
 
-            # 运行算法
             np.random.seed(run)  # 设置随机种子以确保可重复性
             random.seed(run)
             pareto_archive, history = quantum_evolutionary_optimization(
@@ -689,43 +672,37 @@ def calculate_hypervolume(objectives):
     # 计算当前帕累托前沿的最小值（用于min-max归一化）
     objs_min = objs.min(axis=0)
 
-    # 检查参考点是否有效（必须所有目标都大于等于前沿最大值）
+    # 检查参考点是否有效
     for i in range(3):
         if HV_FIXED_REF_POINT[i] < objs[:, i].max():
             # 若参考点不够差，动态扩展（避免归一化后出现负值）
             HV_FIXED_REF_POINT[i] = objs[:, i].max() * 1.1
-
-    # min-max归一化：(x - x_min) / (ref_x - x_min)，将目标值映射到[0,1]
-    # 分母添加EPS避免除零
     norm_objs = (objs - objs_min) / (HV_FIXED_REF_POINT - objs_min + EPS)
 
-    # 确保归一化后的值在[0,1]范围内（处理数值误差）
+    # 处理数值误差
     norm_objs = np.clip(norm_objs, 0.0, 1.0)
 
-    # 3D超体积计算：按CT排序后累加体积
-    # 1. 按第一个目标（CT）升序排序
+    # 3D超体积计算
     sorted_indices = np.argsort(norm_objs[:, 0])
     sorted_objs = norm_objs[sorted_indices]
-
-    # 2. 初始化超体积
     hypervolume = 0.0
     num_points = len(sorted_objs)
 
-    # 3. 累加每个点贡献的体积
+    # 累加每个点贡献的体积
     for i in range(num_points):
         # 当前点的坐标
         x, y, z = sorted_objs[i]
 
-        # 计算当前点在y-z平面的"有效面积"（参考点为(1,1,1)）
+        # 计算当前点在y-z平面的"有效面积"
         area = (1.0 - y) * (1.0 - z)
 
-        # 计算x方向的长度（到下一个点的距离，最后一个点到参考点）
+        # 计算x方向的长度
         if i < num_points - 1:
             dx = sorted_objs[i + 1, 0] - x
         else:
             dx = 1.0 - x  # 最后一个点到参考点的距离
 
-        # 累加体积（面积 × 长度）
+        # 累加体积
         hypervolume += area * dx
 
     return hypervolume
@@ -826,9 +803,9 @@ if __name__ == "__main__":
     MAX_ITER = 100
     N_OBS_BASE = 3
 
-    # 变异概率实验参数（可根据需要调整）
+    # 变异概率实验参数
     P_MUT_MAX_VALUES = [0.04, 0.06, 0.08, 0.10]
-    NUM_RUNS = 5  # 每个变异概率运行次数（调试时可设小，正式实验设20+）
+    NUM_RUNS = 30  # 每个变异概率运行次数
 
     print("=" * 80)
     print("焊装线三目标IQEA算法 - 变异概率上限实验")
