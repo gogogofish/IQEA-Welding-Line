@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from mpl_toolkits.mplot3d import Axes3D
 
-"""焊装线三目标IQEA算法（变异模式对比实验版）
+"""焊装线三目标IQEA算法
 目标：最小化生产节拍(CT)、最小化工位负载标准差(LoadSTD)、最小化质量损失(QLoss)
 变异模式对比：四种不同比例配置
 """
@@ -85,7 +85,7 @@ N_OBS_BASE = 3
 
 # ==== 质量损失计算模块 ====
 def simple_quality_model(task: int, station: int, tool: int):
-    """根据任务、工位、工具计算质量参数（粗糙度、缺陷率、膨胀量）"""
+
     TOOL_BASE = {0: (0.8, 0.06, 0.02), 1: (0.6, 0.08, -0.01), 2: (0.5, 0.10, 0.03)}
     rb, db, eb = TOOL_BASE.get(tool, (0.7, 0.08, 0.0))
 
@@ -100,7 +100,7 @@ def simple_quality_model(task: int, station: int, tool: int):
 
 
 def calculate_quality_loss(solution) -> float:
-    """计算综合质量损失（三目标中的"质量损失"目标）"""
+
     station_assignment, station_sequences, tool_assignment = solution
     total_roughness = total_defect_rate = total_expansion = 0.0
 
@@ -126,7 +126,6 @@ def calculate_quality_loss(solution) -> float:
 
 # ==== 2. 多目标评估模块 ====
 def evaluate_welding_objectives_with_penalty(solution):
-    """评估三目标值（含约束违反惩罚），返回(原始目标值, 惩罚后目标值, 惩罚值)"""
     station_assignment, station_sequences, tool_assignment = solution
     penalty = 0.0
 
@@ -142,7 +141,7 @@ def evaluate_welding_objectives_with_penalty(solution):
             except ValueError:
                 penalty += 0.0
 
-    # 计算工位负载（含工具切换成本）
+    # 计算工位负载
     station_times = np.zeros(NUM_STATIONS)
     for s in range(NUM_STATIONS):
         seq = station_sequences[s]
@@ -310,9 +309,9 @@ def select_representative_solutions(pareto_archive):
     return reps
 
 
-# ==== 5. 量子进化更新模块（修改变异操作） ====
+# ==== 5. 量子进化更新模块 ====
 def update_Q(Q, guided_archive, X_obs, t, max_iter, mutation_mode):
-    """更新量子种群的量子态（按照指定变异模式比例）"""
+
     pop_size, num_qubits, _ = Q.shape
     new_Q = np.copy(Q)
     valid_size = len(guided_archive)
@@ -370,7 +369,6 @@ def update_Q(Q, guided_archive, X_obs, t, max_iter, mutation_mode):
     size_factor = 1.0 / (1.0 + np.log1p(max(archive_size, 1)))
     p_mut = p_mut_min + (p_mut_max - p_mut_min) * (1 - progress) * size_factor
 
-    # 根据变异模式设置比例
     p_reinit_ratio, p_flip_ratio, p_rotate_ratio = MUTATION_MODES[mutation_mode]
     p_reinit = p_reinit_ratio * p_mut
     p_flip = p_flip_ratio * p_mut
@@ -481,9 +479,8 @@ def local_qloss_improvement(solution, obj_values):
     return solution, obj_values
 
 
-# ==== 7. IQEA主循环（支持变异模式参数） ====
+# ==== 7. IQEA主循环 ====
 def quantum_evolutionary_optimization(pop_size=30, max_iter=100, n_obs_base=3, mutation_mode="mode 1 (50-40-10)"):
-    """三目标量子进化算法主循环，返回(帕累托档案, 优化历史记录)"""
     num_qubits = NUM_TASKS * (NUM_STATIONS + NUM_TOOL_TYPES + 1)
     Q = np.zeros((pop_size, num_qubits, 2))
     Q[:, :, 0] = Q[:, :, 1] = 1 / np.sqrt(2)
@@ -514,7 +511,7 @@ def quantum_evolutionary_optimization(pop_size=30, max_iter=100, n_obs_base=3, m
             if not np.any(np.isinf(orig_obj)):
                 pareto_archive = update_archive(pareto_archive, sol, orig_obj)
 
-        if progress > 0.7:
+        if progress > 0.5:
             improved_archive = []
             for sol, obj in pareto_archive:
                 improved_sol, improved_obj = local_qloss_improvement(sol, obj)
@@ -723,7 +720,6 @@ def plot_statistical_comparison(results):
 
         for run_idx in range(NUM_RUNS):
             history = mode_results['histories'][run_idx]
-            # 取最后10代的平均值作为最终性能
             if len(history['best_ct']) >= 10:
                 final_ct_values.append(np.mean(history['best_ct'][-10:]))
                 final_std_values.append(np.mean(history['best_load_std'][-10:]))
