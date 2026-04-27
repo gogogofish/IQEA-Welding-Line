@@ -61,12 +61,9 @@ MAX_ARCHIVE_SIZE = 20
 QUAL_ALPHA = 0.2  # 粗糙度权重系数
 QUAL_BETA = 0.5  # 缺陷率权重系数
 QUAL_GAMMA = 0.3  # 膨胀量权重系数
-TARGET_EXPANSION = 0.025  # 目标膨胀量（
+TARGET_EXPANSION = 0.025  # 目标膨胀量
 POSITIVE_WEIGHT = 1.5  # 膨胀量正偏差权重
 NEGATIVE_WEIGHT = 0.8  # 膨胀量负偏差权重
-
-# ==== CT阈值参数 ====
-MAX_CT_THRESHOLD = 600.0  # 生产节拍最大允许阈值
 
 # ==== 变异模式配置 ====
 MUTATION_MODES = {
@@ -269,9 +266,6 @@ def dominates(a, b):
 
 def update_archive(archive, cand_solution, cand_obj):
     """更新帕累托档案，使用ε-支配"""
-    if cand_obj[0] > MAX_CT_THRESHOLD:
-        return archive
-
     for _, obj in archive:
         if dominates(obj, cand_obj):
             return archive
@@ -400,7 +394,6 @@ def update_Q(Q, guided_archive, X_obs, t, max_iter, mutation_mode):
             new_alpha /= norm
             new_beta /= norm
 
-            # 按照指定比例进行变异操作
             p1 = float(abs(new_beta) ** 2)
             polarization = abs(p1 - 0.5)
             boost = 1.0 + 1.5 * max(0.0, polarization - 0.35)
