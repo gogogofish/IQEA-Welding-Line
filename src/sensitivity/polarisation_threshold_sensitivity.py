@@ -68,13 +68,9 @@ TARGET_EXPANSION = 0.025  # 目标膨胀量
 POSITIVE_WEIGHT = 1.5  # 膨胀量正偏差权重
 NEGATIVE_WEIGHT = 0.8  # 膨胀量负偏差权重
 
-# ==== CT阈值参数 ====
-MAX_CT_THRESHOLD = 600.0  # 生产节拍最大允许阈值
-
 
 # ==== 1. 质量损失计算模块 ====
 def simple_quality_model(task: int, station: int, tool: int):
-    """根据任务、工位、工具计算质量参数（粗糙度、缺陷率、膨胀量）"""
     TOOL_BASE = {0: (0.8, 0.06, 0.02), 1: (0.6, 0.08, -0.01), 2: (0.5, 0.10, 0.03)}
     rb, db, eb = TOOL_BASE.get(tool, (0.7, 0.08, 0.0))
 
@@ -89,7 +85,6 @@ def simple_quality_model(task: int, station: int, tool: int):
 
 
 def calculate_quality_loss(solution) -> float:
-    """计算综合质量损失（三目标中的"质量损失"目标）"""
     station_assignment, station_sequences, tool_assignment = solution
     total_roughness = total_defect_rate = total_expansion = 0.0
 
@@ -115,7 +110,6 @@ def calculate_quality_loss(solution) -> float:
 
 # ==== 2. 多目标评估模块 ====
 def evaluate_welding_objectives_with_penalty(solution):
-    """评估三目标值（含约束违反惩罚），返回(原始目标值, 惩罚后目标值, 惩罚值)"""
     station_assignment, station_sequences, tool_assignment = solution
     penalty = 0.0
 
@@ -129,7 +123,7 @@ def evaluate_welding_objectives_with_penalty(solution):
                 if seq.index(pre) >= seq.index(post):
                     penalty += 10.0
             except ValueError:
-                penalty += 0.0  # 空工位施加惩罚5分
+                penalty += 0.0 
 
     # 计算工位负载（含工具切换成本）
     station_times = np.zeros(NUM_STATIONS)
@@ -253,7 +247,7 @@ def dominates(a, b):
     # 检查是否至少有一个目标严格ε-支配
     ct_strict = a[0] < b[0] - EPS_CT
     std_strict = a[1] < b[1] - EPS_STD
-    qloss_strict = a[2] < b[2]  # QLoss已经要求严格更小
+    qloss_strict = a[2] < b[2] 
 
     any_strict = ct_strict or std_strict or qloss_strict
 
@@ -262,10 +256,6 @@ def dominates(a, b):
 
 def update_archive(archive, cand_solution, cand_obj):
     """更新帕累托档案，使用ε-支配"""
-    # 如果候选解CT超过阈值，直接返回原档案
-    if cand_obj[0] > MAX_CT_THRESHOLD:
-        return archive
-
     # 候选解被档案中任意解ε-支配则丢弃
     for _, obj in archive:
         if dominates(obj, cand_obj):
@@ -431,7 +421,6 @@ def update_Q(Q, guided_archive, X_obs, t, max_iter, polarization_threshold=0.35)
                     delta = np.random.uniform(-phi_max, phi_max)
                     c2, s2 = np.cos(delta), np.sin(delta)
                     new_alpha, new_beta = c2 * new_alpha - s2 * new_beta, s2 * new_alpha + c2 * new_beta
-                # 再次归一化
                 norm = np.hypot(new_alpha, new_beta)
                 if norm < EPS:
                     new_alpha, new_beta = 1 / np.sqrt(2), 1 / np.sqrt(2)
@@ -459,7 +448,6 @@ def local_qloss_improvement(solution, obj_values):
         original_tool = tool_assignment[task]
         allowed_tools = list(ALLOWED_TOOLS[task])
 
-        # 如果只有一个可选工具，跳过
         if len(allowed_tools) <= 1:
             continue
 
@@ -479,18 +467,16 @@ def local_qloss_improvement(solution, obj_values):
             test_obj, _, _ = evaluate_welding_objectives_with_penalty(test_solution)
             test_ct, test_std, test_qloss = test_obj
 
-            # 检查是否满足改进条件：CT和LoadSTD不恶化，QLoss降低
-            # 使用更严格的条件：CT和LoadSTD不能增加，QLoss必须降低
-            ct_ok = test_ct <= ct  # 不允许CT增加
-            std_ok = test_std <= load_std  # 不允许LoadSTD增加
+            ct_ok = test_ct <= ct 
+            std_ok = test_std <= load_std 
             qloss_improved = test_qloss < qloss - EPS  # QLoss需要严格降低
 
             if ct_ok and std_ok and qloss_improved:
-                # 接受改进
+
                 new_tool_assignment = test_tool_assignment
                 ct, load_std, qloss = test_ct, test_std, test_qloss
                 improved = True
-                break  # 找到一个改进就跳出内层循环
+                break  
 
     # 如果有改进，返回新解和新目标值
     if improved:
@@ -504,7 +490,7 @@ def local_qloss_improvement(solution, obj_values):
 
 # ==== 7. IQEA主循环 ====
 def quantum_evolutionary_optimization(pop_size=30, max_iter=100, n_obs_base=3, polarization_threshold=0.35):
-    """三目标量子进化算法主循环，返回(帕累托档案, 优化历史记录, 极化度统计)"""
+    """三目标量子进化算法主循环"""
     # 初始化量子种群（等概率状态 |0⟩+|1⟩/√2）
     num_qubits = NUM_TASKS * (NUM_STATIONS + NUM_TOOL_TYPES + 1)
     Q = np.zeros((pop_size, num_qubits, 2))
@@ -542,7 +528,7 @@ def quantum_evolutionary_optimization(pop_size=30, max_iter=100, n_obs_base=3, p
                 pareto_archive = update_archive(pareto_archive, sol, orig_obj)
 
         # 在后期迭代中应用QLoss局部改进
-        if progress > 0.7:  # 最后30%的迭代
+        if progress > 0.5:  
             improved_archive = []
             for sol, obj in pareto_archive:
                 improved_sol, improved_obj = local_qloss_improvement(sol, obj)
