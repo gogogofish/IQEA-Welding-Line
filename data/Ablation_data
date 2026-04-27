@@ -1,0 +1,6 @@
+Method	HV_mean	HV_std	Objective_space_variance_mean	Objective_space_variance_std	CT_mean	CT_std	LoadSTD_mean	LoadSTD_std	QLoss_mean	QLoss_std
+FULL	0.76	0.07	0.03	0.01	466.82	13.87	76.99	9.88	0.162	0.001
+Abl-1	0.67	0.05	0.04	0.02	471.35	13.72	80.85	10.37	0.164	0.001
+Abl-2	0.77	0.05	0.05	0.01	471.67	12.27	74.36	7.77	0.161	0.001
+Abl-3	0.42	0.07	0.02	0.02	535.87	32.04	125.94	19.24	0.171	0.002
+Abl-4	0.76	0.08	0.05	0.02	471.29	14.33	79.91	10.74	0.162	0.001
