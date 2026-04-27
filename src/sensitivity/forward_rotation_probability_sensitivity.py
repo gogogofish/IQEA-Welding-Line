@@ -104,7 +104,7 @@ def calculate_quality_loss(solution) -> float:
     return QUAL_ALPHA * roughness_loss + QUAL_BETA * defect_loss + QUAL_GAMMA * expansion_loss
 
 
-# ===================== 2) 三目标评估（含惩罚） =====================
+# ===================== 2) 三目标评估 =====================
 def evaluate_welding_objectives_with_penalty(solution):
     station_assignment, station_sequences, tool_assignment = solution
     penalty = 0.0
@@ -236,7 +236,7 @@ def observe_individual(Q_j, n_obs):
             st_probs = st_probs / st_probs.sum() if st_probs.sum() > EPS else (np.ones(NUM_STATIONS) / NUM_STATIONS)
             station_assignment[task] = np.random.choice(NUM_STATIONS, p=st_probs)
 
-        # 任务-工具（固定 3 类工具）
+        # 任务-工具
         for task in range(NUM_TASKS):
             tl_probs = []
             for tt in range(NUM_TOOL_TYPES):
@@ -376,7 +376,7 @@ def update_Q(Q, guided_archive, X_obs, t, max_iter, p_forward: float):
     ref_bits = np.array(ref_bits, dtype=int)
 
     base_angle = 0.03 * np.pi * np.exp(-t / (max_iter / 2))
-    p_mut = 0.03 * (1 - progress) + 0.01  # 简化版：保持你原来风格
+    p_mut = 0.03 * (1 - progress) + 0.01 
 
     update_indices = np.random.choice(pop_size, size=valid_size, replace=False)
 
@@ -485,7 +485,6 @@ def calculate_hypervolume(points, ref_point):
     if P.ndim != 2 or P.shape[1] != 3:
         return 0.0
 
-    # 过滤掉非有限值
     mask = np.all(np.isfinite(P), axis=1)
     P = P[mask]
     if len(P) == 0:
@@ -514,10 +513,9 @@ def run_p_forward_sensitivity_experiment(
     seed0=10000,
     verbose=True,
 ):
-    """配对设计：同一 seed 在不同 p_forward 下各跑一次，保证曲线对比和HV分布更公平。"""
+    """同一 seed 在不同 p_forward 下各跑一次，保证曲线对比和HV分布更公平。"""
     seeds = [seed0 + k for k in range(n_runs)]
 
-    # 先跑全实验，缓存每次运行的Pareto点集，用于统一 ref_point
     cached_objs = {p: [] for p in p_list}
     cached_hist = {p: [] for p in p_list}
 
@@ -558,7 +556,6 @@ def run_p_forward_sensitivity_experiment(
         all_points = np.vstack(all_points)
         ref_point = np.max(all_points, axis=0) * 1.1
     else:
-        # 兜底
         ref_point = np.array([1000.0, 100.0, 10.0], dtype=float)
 
     results = {"hv": {p: [] for p in p_list}, "history": {p: [] for p in p_list}, "ref_point": ref_point}
@@ -574,7 +571,6 @@ def run_p_forward_sensitivity_experiment(
 
 # ===================== 10) 可视化 =====================
 def _avg_curve(histories, key, smooth_window=3):
-    # 对齐到 max_iter，缺失/inf 忽略
     max_len = max(len(h.get(key, [])) for h in histories) if histories else 0
     if max_len == 0:
         return np.array([])
