@@ -1,4 +1,3 @@
-
 import csv
 import json
 import math
@@ -7,17 +6,19 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
+from scipy.stats import mannwhitneyu
 
 EPS = 1e-12
 
 # =========================
 # 固定输入/输出路径
 # =========================
-IQEA_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\iqea_data\iqea_20runs_all_fronts.csv"
-MOPSO_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\mopso_data\combined_front_all_runs.csv"
-NSGAII_PATH = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\nsga2_data\nsga2_20runs_all_fronts.csv"
+IQEA_PATH = r"C:\iqea_20runs_results_simplified_stats\iqea_20runs_all_fronts" \
+            r".csv "
+MOPSO_PATH = r"C:\mopso_results\combined_front_all_runs.csv"
+NSGAII_PATH = r"C:\nsga2_runs_output\nsga2_20runs_all_fronts.csv"
 
-OUT_DIR = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\reference_front_results"
+OUT_DIR = r"C:\Users\86138\Desktop\沪二工大\量子进化算法\Githhub仓库版\reference_front_results_now"
 
 # HV 在归一化空间中的参考点
 HV_REF_POINT = np.array([1.1, 1.1, 1.1], dtype=float)
@@ -34,8 +35,6 @@ def read_front_csv(path: str, algorithm: str) -> List[PointRecord]:
     """
     读取前沿文件，要求至少有三列:
         CT, LoadSTD, QLoss
-    可选列:
-        run
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在: {path}")
@@ -57,7 +56,7 @@ def read_front_csv(path: str, algorithm: str) -> List[PointRecord]:
                 std = float(row["LoadSTD"])
                 ql = float(row["QLoss"])
             except Exception as e:
-                raise ValueError(f"解析 {path} 中的行失败: {row}") from e
+                raise ValueError(f"解析 {path} 中的行失败: {row}")
 
             records.append(
                 PointRecord(
@@ -118,7 +117,7 @@ def non_dominated_mask(points: np.ndarray, eps: float = EPS) -> np.ndarray:
 
 
 def filter_nondominated(points: np.ndarray) -> np.ndarray:
-    """去重后做非支配筛选。"""
+    """去重后做非支配筛选 """
     points = dedupe_points(points)
     if len(points) == 0:
         return points
@@ -139,10 +138,7 @@ def hypervolume_1d(points_1d: np.ndarray, ref_1d: float) -> float:
 
 def hypervolume_recursive(points: np.ndarray, ref: np.ndarray) -> float:
     """
-    最小化问题的精确 HV 递归计算。
-    假设:
-      - 输入点已非支配
-      - 输入点都不超过 ref
+    最小化问题的精确 HV 递归计算
     """
     if len(points) == 0:
         return 0.0
@@ -167,8 +163,7 @@ def hypervolume_recursive(points: np.ndarray, ref: np.ndarray) -> float:
 
 def compute_hv(norm_front: np.ndarray, ref_point: np.ndarray) -> float:
     """
-    归一化最小化空间中的 HV。
-    超过参考点的点不会贡献体积，因此先过滤。
+    归一化最小化空间中的 HV
     """
     if len(norm_front) == 0:
         return float("nan")
@@ -184,7 +179,7 @@ def compute_hv(norm_front: np.ndarray, ref_point: np.ndarray) -> float:
 
 def compute_igd(norm_front: np.ndarray, norm_reference_front: np.ndarray) -> float:
     """
-    归一化空间中的 IGD。
+    归一化空间中的 IGD
     """
     if len(norm_reference_front) == 0 or len(norm_front) == 0:
         return float("nan")
@@ -205,6 +200,42 @@ def mean_std(values: List[float]) -> Tuple[float, float]:
     if arr.size == 1:
         return float(arr.mean()), 0.0
     return float(arr.mean()), float(arr.std(ddof=1))
+
+
+# =========================
+# 显著性检验：Mann–Whitney U + Holm
+# =========================
+def mann_whitney_pvalue(x: List[float], y: List[float]) -> float:
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    x_arr = x_arr[np.isfinite(x_arr)]
+    y_arr = y_arr[np.isfinite(y_arr)]
+
+    if x_arr.size == 0 or y_arr.size == 0:
+        return float("nan")
+
+    return float(mannwhitneyu(x_arr, y_arr, alternative="two-sided").pvalue)
+
+
+def holm_correction(pvals: List[float]) -> List[float]:
+    """
+    Holm-Bonferroni 校正
+    输入顺序不变，输出与输入顺序一一对应。
+    """
+    pvals = np.asarray(pvals, dtype=float)
+    m = len(pvals)
+    order = np.argsort(pvals)
+    adjusted = np.zeros(m, dtype=float)
+
+    prev = 0.0
+    for k, idx in enumerate(order):
+        adj = (m - k) * pvals[idx]
+        adj = min(adj, 1.0)
+        adj = max(adj, prev)  # 保证单调
+        adjusted[idx] = adj
+        prev = adj
+
+    return adjusted.tolist()
 
 
 def main():
@@ -345,6 +376,32 @@ def main():
         mean_std_rows,
     )
 
+    # 7) 显著性检验：IQEA vs NSGA-II / MOPSO
+    comparisons = [("IQEA", "NSGA-II"), ("IQEA", "MOPSO")]
+
+    raw_hv_p = [mann_whitney_pvalue(algo_hv_values[a], algo_hv_values[b]) for a, b in comparisons]
+    raw_igd_p = [mann_whitney_pvalue(algo_igd_values[a], algo_igd_values[b]) for a, b in comparisons]
+
+    holm_hv_p = holm_correction(raw_hv_p)
+    holm_igd_p = holm_correction(raw_igd_p)
+
+    sig_rows = []
+    for i, (a, b) in enumerate(comparisons):
+        sig_rows.append([
+            f"{a} vs {b}",
+            f"{raw_hv_p[i]:.10g}",
+            f"{holm_hv_p[i]:.10g}",
+            f"{raw_igd_p[i]:.10g}",
+            f"{holm_igd_p[i]:.10g}",
+        ])
+
+    significance_csv = os.path.join(OUT_DIR, "wilcoxon_holm_significance.csv")
+    save_csv(
+        significance_csv,
+        ["Comparison", "HV_p", "HV_Holm_p", "IGD_p", "IGD_Holm_p"],
+        sig_rows,
+    )
+
     print("=" * 80)
     print("规范流程计算完成。")
     print(f"并集 U 文件: {union_csv}")
@@ -352,12 +409,21 @@ def main():
     print(f"带来源 reference front 文件: {reference_with_source_csv}")
     print(f"每次运行 HV/IGD 文件: {per_run_csv}")
     print(f"HV/IGD mean±std 文件: {mean_std_csv}")
+    print(f"显著性检验文件: {significance_csv}")
     print(f"归一化信息文件: {normalization_json}")
     print("-" * 80)
     print(f"|U| = {len(union_points)}, |R| = {len(reference_front)}")
     print("HV 和 IGD 的 mean ± std：")
     for row in mean_std_rows:
         print(f"{row[0]:7s} | HV = {row[6]} | IGD = {row[7]}")
+
+    print("-" * 80)
+    print("Mann–Whitney U 检验 + Holm 校正结果：")
+    for row in sig_rows:
+        print(
+            f"{row[0]} | HV p={row[1]}, HV Holm p={row[2]} | "
+            f"IGD p={row[3]}, IGD Holm p={row[4]}"
+        )
     print("=" * 80)
 
 
